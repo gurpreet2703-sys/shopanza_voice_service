@@ -1,8 +1,8 @@
 {
-  "name": "ws-server",
+  "name": "voicebot",
   "version": "1.0.0",
-  "main": "server.js",
   "dependencies": {
-    "ws": "^8.0.0"
+    "ws": "^8.0.0",
+    "axios": "^1.6.0"
   }
 }
