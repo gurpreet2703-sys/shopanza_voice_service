@@ -3,166 +3,122 @@ const axios = require("axios");
 
 const server = new WebSocket.Server({ port: process.env.PORT });
 
+// session memory
+const sessions = new Map();
+
 server.on("connection", (ws) => {
+
     console.log("Exotel connected");
 
-    let call_id = "";
-    let mobile = "";
+    let session = {
+        call_id: null,
+        mobile: null,
+        buffer: [],
+        processing: false,
+        timer: null
+    };
 
-    let audioBuffer = [];
-    let flushTimer = null;
-
-    let isProcessing = false;
-    let callActive = false;
-    let lastMediaTime = Date.now();
-
-    // ================= FORCE END CALL =================
-    const FORCE_END_TIMEOUT = setTimeout(() => {
-        console.log("FORCE END CALL (timeout)");
+    // ================= MESSAGE =================
+    ws.on("message", async (msg) => {
 
         try {
-            ws.send(JSON.stringify({ event: "stop" }));
-            ws.send(JSON.stringify({ event: "hangup" }));
-            ws.close();
-        } catch (e) {}
-    }, 2 * 60 * 1000); // 2 min max call
+            let data = JSON.parse(msg.toString());
 
-    // ================= SILENCE WATCHDOG =================
-    const silenceCheck = setInterval(() => {
-        if (!callActive) return;
+            // ================= START =================
+            if (data.event === "start") {
 
-        const now = Date.now();
+                session.call_id = data.start.call_sid;
+                session.mobile = data.start.from;
 
-        if (now - lastMediaTime > 10000) {
-            console.log("Silence detected → ending call");
+                sessions.set(session.call_id, session);
 
-            try {
-                flushAudio();
-                ws.send(JSON.stringify({ event: "stop" }));
-                ws.send(JSON.stringify({ event: "hangup" }));
-                ws.close();
-            } catch (e) {}
+                console.log("CALL START:", session.call_id);
+
+                let res = await axios.get(
+                    "https://www.shopanzaservices.in/app_files/response.aspx",
+                    {
+                        params: {
+                            step: "start",
+                            call_id: session.call_id,
+                            mobile: session.mobile
+                        }
+                    }
+                );
+
+                if (res.data.audio_url) {
+                    sendAudio(ws, res.data.audio_url);
+                }
+            }
+
+            // ================= MEDIA =================
+            if (data.event === "media") {
+
+                if (!session.call_id || session.processing) return;
+
+                session.buffer.push(data.media.payload);
+
+                debounceProcess(session, ws);
+            }
+
+            // ================= STOP =================
+            if (data.event === "stop") {
+                console.log("CALL END:", session.call_id);
+                sessions.delete(session.call_id);
+            }
+
+        } catch (e) {
+            console.log("WS ERROR:", e.message);
         }
-    }, 5000);
+    });
 
-    // ================= FLUSH AUDIO =================
-    const flushAudio = async () => {
-        if (!audioBuffer.length || isProcessing) return;
+});
 
-        isProcessing = true;
+// ================= DEBOUNCE PROCESS =================
+function debounceProcess(session, ws) {
 
-        let fullAudio = audioBuffer.join("");
-        audioBuffer = [];
+    clearTimeout(session.timer);
+
+    session.timer = setTimeout(async () => {
+
+        if (session.processing) return;
+
+        session.processing = true;
+
+        const audioBase64 = session.buffer.join("");
+        session.buffer = [];
 
         try {
-            const res = await axios.post(
-                "https://www.shopanzaservices.in/app_files/response.aspx",
+
+            let res = await axios.post(
+                "https://www.shopanzaservices.in/app_files/voice_ai_handler.aspx",
                 {
-                    call_id,
-                    mobile,
-                    audio: fullAudio
+                    call_id: session.call_id,
+                    mobile: session.mobile,
+                    audio: audioBase64
                 },
                 {
                     headers: { "Content-Type": "application/json" }
                 }
             );
 
-            console.log("Backend:", res.data);
-
-            if (res.data && res.data.audio_url) {
-                await sendAudio(ws, res.data.audio_url);
+            if (res.data.audio_url) {
+                sendAudio(ws, res.data.audio_url);
             }
 
-            if (res.data && res.data.status === "completed") {
-                console.log("Call completed from backend");
+            if (res.data.status === "completed") {
+                console.log("CALL COMPLETED");
 
                 ws.send(JSON.stringify({ event: "stop" }));
-                ws.send(JSON.stringify({ event: "hangup" }));
-                ws.close();
             }
 
         } catch (err) {
-            console.log("Backend error:", err.message);
-        } finally {
-            isProcessing = false;
+            console.log("BACKEND ERROR:", err.message);
         }
-    };
 
-    // ================= MESSAGE HANDLER =================
-    ws.on("message", async (msg) => {
-        try {
-            let data = JSON.parse(msg.toString());
+        session.processing = false;
 
-            // ================= START =================
-            if (data.event === "start") {
-                call_id = data.start.call_sid;
-                mobile = data.start.from;
-
-                console.log("CALL START:", call_id, mobile);
-
-                callActive = true;
-                lastMediaTime = Date.now();
-
-                const res = await axios.get(
-                    "https://www.shopanzaservices.in/app_files/response.aspx",
-                    {
-                        params: {
-                            step: "start",
-                            call_id,
-                            mobile
-                        }
-                    }
-                );
-
-                if (res.data && res.data.audio_url) {
-                    await sendAudio(ws, res.data.audio_url);
-                }
-            }
-
-            // ================= MEDIA =================
-            if (data.event === "media") {
-                if (!call_id) return;
-
-                callActive = true;
-                lastMediaTime = Date.now();
-
-                audioBuffer.push(data.media.payload);
-
-                clearTimeout(flushTimer);
-
-                flushTimer = setTimeout(() => {
-                    flushAudio();
-                }, 900);
-
-                if (audioBuffer.length > 25) {
-                    flushAudio();
-                }
-            }
-
-            // ================= STOP =================
-            if (data.event === "stop") {
-                console.log("CALL STOP RECEIVED:", call_id);
-
-                clearTimeout(flushTimer);
-                clearTimeout(FORCE_END_TIMEOUT);
-                clearInterval(silenceCheck);
-
-                ws.close();
-            }
-
-        } catch (e) {
-            console.log("WS Error:", e.message);
-        }
-    });
-
-    ws.on("close", () => {
-        console.log("WS CLOSED:", call_id);
-        clearTimeout(flushTimer);
-        clearInterval(silenceCheck);
-    });
-
-    ws.send(JSON.stringify({ event: "connected" }));
-});
+    }, 400); // FAST TURN TIME
+}
 
 // ================= SEND AUDIO =================
 async function sendAudio(ws, url) {
@@ -178,6 +134,6 @@ async function sendAudio(ws, url) {
         console.log("Audio sent");
 
     } catch (err) {
-        console.log("Audio error:", err.message);
+        console.log("TTS ERROR:", err.message);
     }
 }
