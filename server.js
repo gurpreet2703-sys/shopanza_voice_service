@@ -12,16 +12,50 @@ server.on("connection", (ws) => {
     let audioBuffer = [];
     let flushTimer = null;
 
-    // ================= FLUSH FUNCTION =================
-    const flushAudio = async () => {
+    let isProcessing = false;
+    let callActive = false;
+    let lastMediaTime = Date.now();
 
-        if (!audioBuffer.length) return;
+    // ================= FORCE END CALL =================
+    const FORCE_END_TIMEOUT = setTimeout(() => {
+        console.log("FORCE END CALL (timeout)");
+
+        try {
+            ws.send(JSON.stringify({ event: "stop" }));
+            ws.send(JSON.stringify({ event: "hangup" }));
+            ws.close();
+        } catch (e) {}
+    }, 2 * 60 * 1000); // 2 min max call
+
+    // ================= SILENCE WATCHDOG =================
+    const silenceCheck = setInterval(() => {
+        if (!callActive) return;
+
+        const now = Date.now();
+
+        if (now - lastMediaTime > 10000) {
+            console.log("Silence detected → ending call");
+
+            try {
+                flushAudio();
+                ws.send(JSON.stringify({ event: "stop" }));
+                ws.send(JSON.stringify({ event: "hangup" }));
+                ws.close();
+            } catch (e) {}
+        }
+    }, 5000);
+
+    // ================= FLUSH AUDIO =================
+    const flushAudio = async () => {
+        if (!audioBuffer.length || isProcessing) return;
+
+        isProcessing = true;
 
         let fullAudio = audioBuffer.join("");
         audioBuffer = [];
 
         try {
-            let res = await axios.post(
+            const res = await axios.post(
                 "https://www.shopanzaservices.in/app_files/response.aspx",
                 {
                     call_id,
@@ -35,34 +69,41 @@ server.on("connection", (ws) => {
 
             console.log("Backend:", res.data);
 
-            if (res.data.audio_url) {
+            if (res.data && res.data.audio_url) {
                 await sendAudio(ws, res.data.audio_url);
             }
 
-            if (res.data.status === "completed") {
-                console.log("Call completed");
+            if (res.data && res.data.status === "completed") {
+                console.log("Call completed from backend");
 
                 ws.send(JSON.stringify({ event: "stop" }));
+                ws.send(JSON.stringify({ event: "hangup" }));
+                ws.close();
             }
 
         } catch (err) {
             console.log("Backend error:", err.message);
+        } finally {
+            isProcessing = false;
         }
     };
 
+    // ================= MESSAGE HANDLER =================
     ws.on("message", async (msg) => {
         try {
             let data = JSON.parse(msg.toString());
 
             // ================= START =================
             if (data.event === "start") {
-
                 call_id = data.start.call_sid;
                 mobile = data.start.from;
 
                 console.log("CALL START:", call_id, mobile);
 
-                let res = await axios.get(
+                callActive = true;
+                lastMediaTime = Date.now();
+
+                const res = await axios.get(
                     "https://www.shopanzaservices.in/app_files/response.aspx",
                     {
                         params: {
@@ -73,24 +114,26 @@ server.on("connection", (ws) => {
                     }
                 );
 
-                await sendAudio(ws, res.data.audio_url);
+                if (res.data && res.data.audio_url) {
+                    await sendAudio(ws, res.data.audio_url);
+                }
             }
 
             // ================= MEDIA =================
             if (data.event === "media") {
-
                 if (!call_id) return;
+
+                callActive = true;
+                lastMediaTime = Date.now();
 
                 audioBuffer.push(data.media.payload);
 
-                // reset silence timer
                 clearTimeout(flushTimer);
 
                 flushTimer = setTimeout(() => {
                     flushAudio();
-                }, 900); // speech pause detection
+                }, 900);
 
-                // safety flush (prevents infinite buffer)
                 if (audioBuffer.length > 25) {
                     flushAudio();
                 }
@@ -98,12 +141,24 @@ server.on("connection", (ws) => {
 
             // ================= STOP =================
             if (data.event === "stop") {
-                console.log("Call ended:", call_id);
+                console.log("CALL STOP RECEIVED:", call_id);
+
+                clearTimeout(flushTimer);
+                clearTimeout(FORCE_END_TIMEOUT);
+                clearInterval(silenceCheck);
+
+                ws.close();
             }
 
         } catch (e) {
             console.log("WS Error:", e.message);
         }
+    });
+
+    ws.on("close", () => {
+        console.log("WS CLOSED:", call_id);
+        clearTimeout(flushTimer);
+        clearInterval(silenceCheck);
     });
 
     ws.send(JSON.stringify({ event: "connected" }));
