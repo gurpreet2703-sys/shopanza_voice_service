@@ -10,59 +10,62 @@ wss.on('connection', function connection(ws) {
     let streamSid = "";
     let callSid = "";
     let from = "";
-
     let audioChunks = [];
-    let lastAudioTime = Date.now();
 
     ws.on('message', async function incoming(message) {
         try {
-            const data = JSON.parse(message.toString());
+            const msg = JSON.parse(message);
 
             // 🔹 CONNECTED
-            if (data.event === "connected") {
-                console.log("Connected");
+            if (msg.event === "connected") {
+                console.log("Client Connected");
             }
 
-            // 🔹 START
-            if (data.event === "start") {
-                streamSid = data.stream_sid;
-                callSid = data.start.call_sid;
-                from = data.start.from;
+            // 🔹 START EVENT
+            if (msg.event === "start") {
+                streamSid = msg.stream_sid;
+                callSid = msg.start.call_sid;
+                from = msg.start.from;
 
-                console.log("Call Started:", callSid);
+                console.log("Call Started:", callSid, from);
 
+                // 🔥 FIRST TEST AUDIO (STATIC GREETING)
                 await sendTTS(ws, streamSid, "Welcome to Shopanza Services. How may I help you?");
             }
 
-            // 🔹 MEDIA (REAL AUDIO)
-            if (data.event === "media") {
+            // 🔹 MEDIA (USER VOICE)
+            if (msg.event === "media") {
+                if (!msg.media.payload) return;
 
-                lastAudioTime = Date.now();
+                audioChunks.push(msg.media.payload);
 
-                // ✅ decode base64 → buffer
-                let chunk = Buffer.from(data.media.payload, 'base64');
-                audioChunks.push(chunk);
+                // collect ~1 second audio then process
+                if (audioChunks.length > 8) {
 
-                // ✅ process after ~1 sec audio
-                let totalLength = audioChunks.reduce((sum, b) => sum + b.length, 0);
-
-                if (totalLength > 8000) // ~1 sec (8kHz)
-                {
-                    let combinedBuffer = Buffer.concat(audioChunks);
+                    let fullAudio = audioChunks.join("");
                     audioChunks = [];
 
-                    let base64Audio = combinedBuffer.toString('base64');
+                    // 🔥 CALL YOUR ASP.NET BACKEND
+                    const response = await axios.post(
+                        "https://www.shopanzaservices.in/app_files/response.aspx",
+                        {
+                            audio: fullAudio,
+                            call_sid: callSid,
+                            from: from
+                        },
+                        {
+                            headers: { "Content-Type": "application/json" }
+                        }
+                    );
 
-                    let response = await processAudio(callSid, from, base64Audio);
-
-                    if (response && response.audio) {
-                        await sendAudio(ws, streamSid, response.audio);
+                    if (response.data && response.data.audio) {
+                        sendAudio(ws, streamSid, response.data.audio);
                     }
                 }
             }
 
             // 🔹 STOP
-            if (data.event === "stop") {
+            if (msg.event === "stop") {
                 console.log("Call Ended:", callSid);
             }
 
@@ -70,89 +73,50 @@ wss.on('connection', function connection(ws) {
             console.log("Error:", err.message);
         }
     });
-
-    // 🔥 SILENCE HANDLER
-    setInterval(async () => {
-        if (streamSid && Date.now() - lastAudioTime > 5000) {
-            await sendTTS(ws, streamSid, "Kindly respond or call will disconnect.");
-            lastAudioTime = Date.now();
-        }
-    }, 2000);
 });
 
 
-// 🔥 SEND AUDIO (FIXED CHUNKING)
-async function sendAudio(ws, streamSid, base64Audio) {
+// 🔥 SEND AUDIO TO EXOTEL
+function sendAudio(ws, streamSid, base64Audio) {
 
-    let buffer = Buffer.from(base64Audio, 'base64');
+    const chunkSize = 3200; // must be multiple of 320
 
-    let chunkSize = 3200; // multiple of 320 (IMPORTANT)
-    let seq = 0;
+    for (let i = 0; i < base64Audio.length; i += chunkSize) {
 
-    for (let i = 0; i < buffer.length; i += chunkSize) {
-
-        let chunk = buffer.slice(i, i + chunkSize);
+        let chunk = base64Audio.slice(i, i + chunkSize);
 
         ws.send(JSON.stringify({
             event: "media",
             stream_sid: streamSid,
-            sequence_number: seq++,
             media: {
-                payload: chunk.toString('base64')
+                payload: chunk
             }
         }));
-
-        await sleep(100); // smooth playback
-    }
-
-    // 🔹 MARK EVENT (important)
-    ws.send(JSON.stringify({
-        event: "mark",
-        stream_sid: streamSid,
-        mark: { name: "done" }
-    }));
-}
-
-
-// 🔹 BACKEND CALL
-async function processAudio(callSid, from, audioBase64) {
-    try {
-        const res = await axios.post(
-            "https://www.shopanzaservices.in/app_files/response.aspx/process_voice",
-            {
-                call_id: callSid,
-                mobile: from,
-                audio: audioBase64
-            },
-            { timeout: 20000 }
-        );
-
-        return res.data;
-
-    } catch (err) {
-        console.log("Backend Error:", err.message);
-        return null;
     }
 }
 
 
-// 🔹 TTS CALL
+// 🔥 SIMPLE TTS HELPER (TEMP STATIC TEST)
 async function sendTTS(ws, streamSid, text) {
+
     try {
-        const res = await axios.post(
-            "https://www.shopanzaservices.in/app_files/response.aspx/tts",
-            { text: text }
+
+        const response = await axios.post(
+            "https://www.shopanzaservices.in/app_files/response.aspx",
+            {
+                action: "tts",
+                text: text
+            },
+            {
+                headers: { "Content-Type": "application/json" }
+            }
         );
 
-        await sendAudio(ws, streamSid, res.data.audio);
+        if (response.data && response.data.audio) {
+            sendAudio(ws, streamSid, response.data.audio);
+        }
 
     } catch (err) {
         console.log("TTS Error:", err.message);
     }
-}
-
-
-// 🔹 SLEEP
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
 }
