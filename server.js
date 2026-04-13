@@ -30,7 +30,7 @@ wss.on('connection', function connection(ws) {
                 console.log("Call Started:", callSid);
 
                 // GREETING MESSAGE
-                await sendTTS(ws, streamSid, "Welcome to Shopanza Services. How may I help you?");
+                await sendTTS(ws, streamSid, "Welcome to Shopanza Services.");
             }
 
             // MEDIA EVENT (USER SPEAKING)
