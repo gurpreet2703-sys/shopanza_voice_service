@@ -1,37 +1,35 @@
-const WebSocket = require('ws');
-const axios = require('axios');
+const WebSocket = require("ws");
+const axios = require("axios");
 
 const server = new WebSocket.Server({ port: process.env.PORT });
 
-server.on('connection', (ws) => {
-    console.log('Exotel connected');
+server.on("connection", (ws) => {
+    console.log("Exotel connected");
 
     let call_id = "";
     let mobile = "";
+    let audioBuffer = [];
+    let timer = null;
 
-    ws.on('message', async (msg) => {
+    ws.on("message", async (msg) => {
         try {
             let data = JSON.parse(msg.toString());
 
-            console.log("EVENT:", data.event);
-
-            // ================= START EVENT =================
+            // ================= START =================
             if (data.event === "start") {
 
                 call_id = data.start.call_sid;
                 mobile = data.start.from;
 
-                console.log("📞 Call ID:", call_id);
-                console.log("📱 Caller:", mobile);
+                console.log("CALL START:", call_id, mobile);
 
-                // send to backend (initialize session)
                 let res = await axios.get(
                     "https://www.shopanzaservices.in/app_files/response.aspx",
                     {
                         params: {
                             step: "start",
-                            call_id: call_id,
-                            mobile: mobile
+                            call_id,
+                            mobile
                         }
                     }
                 );
@@ -39,53 +37,63 @@ server.on('connection', (ws) => {
                 await sendAudio(ws, res.data.audio_url);
             }
 
-            // ================= MEDIA EVENT =================
+            // ================= MEDIA (BUFFER ONLY) =================
             if (data.event === "media") {
 
-                if (!call_id) {
-                    console.log("❌ call_id missing");
-                    return;
-                }
+                if (!call_id) return;
 
-                // send audio chunk to backend
-                let res = await axios.post(
-                    "https://www.shopanzaservices.in/app_files/response.aspx",
-                    {
-                        call_id: call_id,
-                        mobile: mobile,
-                        audio: data.media.payload
-                    },
-                    {
-                        headers: {
-                            'Content-Type': 'application/json'
+                audioBuffer.push(data.media.payload);
+
+                clearTimeout(timer);
+
+                timer = setTimeout(async () => {
+
+                    if (!audioBuffer.length) return;
+
+                    let fullAudio = audioBuffer.join("");
+                    audioBuffer = [];
+
+                    try {
+                        let res = await axios.post(
+                            "https://www.shopanzaservices.in/app_files/response.aspx",
+                            {
+                                call_id,
+                                mobile,
+                                audio: fullAudio
+                            },
+                            {
+                                headers: { "Content-Type": "application/json" }
+                            }
+                        );
+
+                        console.log("Backend:", res.data);
+
+                        if (res.data.audio_url) {
+                            await sendAudio(ws, res.data.audio_url);
                         }
+
+                        if (res.data.status === "completed") {
+                            console.log("Call completed");
+
+                            setTimeout(() => {
+                                ws.send(JSON.stringify({ event: "stop" }));
+                            }, 3000);
+                        }
+
+                    } catch (err) {
+                        console.log("Backend error:", err.message);
                     }
-                );
 
-                console.log("Backend Response:", res.data);
-
-                // send audio reply
-                if (res.data.audio_url) {
-                    await sendAudio(ws, res.data.audio_url);
-                }
-
-                // if booking completed → end call
-                if (res.data.status === "completed") {
-                    console.log("✅ Booking completed, ending call");
-
-                    setTimeout(() => {
-                        ws.send(JSON.stringify({ event: "stop" }));
-                    }, 4000);
-                }
+                }, 1200);
             }
 
-            // ================= STOP EVENT =================
+            // ================= STOP =================
             if (data.event === "stop") {
-                console.log("📴 Call ended:", call_id);
+                console.log("Call ended:", call_id);
             }
 
         } catch (e) {
-            console.log("❌ Error:", e.message);
+            console.log("WS Error:", e.message);
         }
     });
 
@@ -95,20 +103,17 @@ server.on('connection', (ws) => {
 // ================= SEND AUDIO =================
 async function sendAudio(ws, url) {
     try {
-        const res = await axios.get(url, { responseType: 'arraybuffer' });
-
-        const base64 = Buffer.from(res.data).toString('base64');
+        const res = await axios.get(url, { responseType: "arraybuffer" });
+        const base64 = Buffer.from(res.data).toString("base64");
 
         ws.send(JSON.stringify({
             event: "media",
-            media: {
-                payload: base64
-            }
+            media: { payload: base64 }
         }));
 
-        console.log("🔊 Audio sent");
+        console.log("Audio sent");
 
     } catch (err) {
-        console.log("❌ Audio fetch error:", err.message);
+        console.log("Audio error:", err.message);
     }
 }
