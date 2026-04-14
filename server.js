@@ -67,12 +67,10 @@ wss.on('connection', function connection(ws) {
                                 "Kindly share your response else call will disconnect in five seconds"
                             );
 
-                            // disconnect after warning
                             setTimeout(() => {
                                 console.log("📴 Disconnect due to silence");
                                 ws.close();
                             }, 5000);
-
                         }
 
                         return;
@@ -99,17 +97,20 @@ wss.on('connection', function connection(ws) {
                         }
                     );
 
-                    let data = res.data;
+                    // ✅ FIX: handle ASP.NET response wrapper
+                    let data = res.data.d;
 
                     console.log("🤖 AI Response:", data);
 
                     // 🔊 Play AI response
-                    if (data.audio_url) {
+                    if (data && data.audio_url) {
                         await streamAudio(ws, streamSid, data.audio_url);
+                    } else {
+                        console.log("⚠️ No audio_url received");
                     }
 
                     // ✅ Booking complete → close call
-                    if (data.status === "completed") {
+                    if (data && data.status === "completed") {
                         console.log("✅ Booking Completed, closing call");
                         setTimeout(() => ws.close(), 4000);
                     }
@@ -139,7 +140,10 @@ async function sendTTS(ws, streamSid, text) {
             { headers: { "Content-Type": "application/json" } }
         );
 
-        let audioUrl = res.data.audio_url;
+        // ✅ FIX: ASP.NET wrapper
+        let audioUrl = res.data.d.audio_url;
+
+        console.log("🔊 TTS URL:", audioUrl);
 
         await streamAudio(ws, streamSid, audioUrl);
 
