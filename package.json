@@ -1,12 +1,13 @@
 {
-  "name": "voicebot",
+  "name": "shopanza-voice-wss",
   "version": "1.0.0",
+  "description": "Exotel Voicebot WSS Server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "ws": "^8.0.0",
+    "ws": "^8.13.0",
     "axios": "^1.6.0"
   }
 }
