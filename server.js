@@ -78,7 +78,10 @@ wss.on('connection', function connection(ws) {
 
                     processing = true;
 
-                    let combinedAudio = audioChunks.join("");
+                    // ✅ FIXED MERGE
+                    let buffers = audioChunks.map(b64 => Buffer.from(b64, 'base64'));
+                    let combinedBuffer = Buffer.concat(buffers);
+                    let combinedAudio = combinedBuffer.toString('base64');
 
                     audioChunks = [];
                     bufferStartTime = Date.now();
