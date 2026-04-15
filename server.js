@@ -78,10 +78,31 @@ wss.on('connection', function connection(ws) {
 
                     warningGiven = false;
 
-                    let combinedAudio = audioBuffer.join("");
+                    // ================= ✅ FIXED AUDIO MERGING =================
+                    let buffers = [];
+
+                    for (let i = 0; i < audioBuffer.length; i++) {
+                        try {
+                            let buf = Buffer.from(audioBuffer[i], 'base64');
+                            buffers.push(buf);
+                        } catch (e) {
+                            console.log("⚠️ Invalid chunk skipped");
+                        }
+                    }
+
+                    let combinedBuffer = Buffer.concat(buffers);
+
+                    // ❗ Skip very small audio (noise / silence)
+                    if (combinedBuffer.length < 2000) {
+                        console.log("⏭️ Skipping small audio");
+                        audioBuffer = [];
+                        return;
+                    }
+
+                    let combinedAudio = combinedBuffer.toString('base64');
                     audioBuffer = [];
 
-                    console.log("🎧 Sending audio to backend...");
+                    console.log("🎧 Sending audio to backend... Size:", combinedBuffer.length);
 
                     // 🔥 CALL ASP.NET BACKEND
                     let res = await axios.post(
@@ -97,7 +118,7 @@ wss.on('connection', function connection(ws) {
                         }
                     );
 
-                    // ✅ FIX: handle ASP.NET response wrapper
+                    // ✅ ASP.NET response wrapper fix
                     let data = res.data.d;
 
                     console.log("🤖 AI Response:", data);
@@ -140,7 +161,6 @@ async function sendTTS(ws, streamSid, text) {
             { headers: { "Content-Type": "application/json" } }
         );
 
-        // ✅ FIX: ASP.NET wrapper
         let audioUrl = res.data.d.audio_url;
 
         console.log("🔊 TTS URL:", audioUrl);
@@ -163,8 +183,7 @@ async function streamAudio(ws, streamSid, audioUrl) {
 
         let buffer = Buffer.from(response.data);
 
-        let chunkSize = 3200; // 100ms chunks (IMPORTANT)
-
+        let chunkSize = 3200; // 100ms chunks
         let chunkCount = 0;
 
         for (let i = 0; i < buffer.length; i += chunkSize) {
@@ -180,11 +199,14 @@ async function streamAudio(ws, streamSid, audioUrl) {
             }));
 
             chunkCount++;
+
+            // ✅ IMPORTANT: small delay for smooth playback
+            await new Promise(r => setTimeout(r, 20));
         }
 
         console.log("🔊 Sent chunks:", chunkCount);
 
-        // optional mark
+        // mark event
         ws.send(JSON.stringify({
             event: "mark",
             stream_sid: streamSid,
