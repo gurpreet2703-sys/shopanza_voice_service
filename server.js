@@ -123,7 +123,7 @@ wss.on('connection', function connection(ws) {
         try {
 
             // ⏱ 5 sec → reminder
-            if (silence > 5000 && !reminderSent) {
+            if (silence > 8000 && !reminderSent) {
 
                 reminderSent = true;
 
@@ -135,7 +135,7 @@ wss.on('connection', function connection(ws) {
             }
 
             // ⏱ 10 sec → end call
-            if (silence > 10000) {
+            if (silence > 13000) {
 
                 console.log("📴 Ending call due to no response");
 
