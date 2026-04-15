@@ -20,6 +20,10 @@ wss.on('connection', function connection(ws) {
     let silenceTimer = null;
     let warningGiven = false;
 
+    // ✅ NEW FIXES
+    let isFirstSpeechIgnored = false;
+    let chunkCounter = 0;
+
     console.log("🔌 New Connection");
 
     ws.on('message', async function incoming(message) {
@@ -45,10 +49,29 @@ wss.on('connection', function connection(ws) {
                 await sendTTS(ws, streamSid,
                     "Welcome to Shopanza Services. How may I help you"
                 );
+
+                // ✅ RESET BUFFER AFTER BOT SPEAKS
+                audioBuffer = [];
+                isFirstSpeechIgnored = false;
+                chunkCounter = 0;
             }
 
             // ================= MEDIA =================
             if (msg.event === "media") {
+
+                chunkCounter++;
+
+                // 🚫 IGNORE INITIAL AUDIO (VERY IMPORTANT)
+                if (!isFirstSpeechIgnored) {
+
+                    if (chunkCounter < 15) {
+                        return; // ignore first ~1.5 sec
+                    } else {
+                        console.log("🎤 Starting real capture...");
+                        isFirstSpeechIgnored = true;
+                        audioBuffer = [];
+                    }
+                }
 
                 audioBuffer.push(msg.media.payload);
 
@@ -57,7 +80,7 @@ wss.on('connection', function connection(ws) {
 
                 silenceTimer = setTimeout(async () => {
 
-                    // ❌ No speech detected
+                    // ❌ No speech
                     if (audioBuffer.length === 0) {
 
                         if (!warningGiven) {
@@ -73,6 +96,13 @@ wss.on('connection', function connection(ws) {
                             }, 5000);
                         }
 
+                        return;
+                    }
+
+                    // 🚫 IGNORE VERY SMALL AUDIO (NOISE)
+                    if (audioBuffer.length < 10) {
+                        console.log("⚠️ Ignoring small audio");
+                        audioBuffer = [];
                         return;
                     }
 
@@ -97,7 +127,7 @@ wss.on('connection', function connection(ws) {
                         }
                     );
 
-                    // ✅ FIX: handle ASP.NET response wrapper
+                    // ✅ ASP.NET wrapper fix
                     let data = res.data.d;
 
                     console.log("🤖 AI Response:", data);
@@ -115,7 +145,7 @@ wss.on('connection', function connection(ws) {
                         setTimeout(() => ws.close(), 4000);
                     }
 
-                }, 2000); // 2 sec buffer
+                }, 3000); // ✅ Increased wait time
             }
 
             // ================= STOP =================
@@ -140,7 +170,7 @@ async function sendTTS(ws, streamSid, text) {
             { headers: { "Content-Type": "application/json" } }
         );
 
-        // ✅ FIX: ASP.NET wrapper
+        // ✅ ASP.NET wrapper fix
         let audioUrl = res.data.d.audio_url;
 
         console.log("🔊 TTS URL:", audioUrl);
@@ -163,8 +193,7 @@ async function streamAudio(ws, streamSid, audioUrl) {
 
         let buffer = Buffer.from(response.data);
 
-        let chunkSize = 3200; // 100ms chunks (IMPORTANT)
-
+        let chunkSize = 3200; // 100ms chunks
         let chunkCount = 0;
 
         for (let i = 0; i < buffer.length; i += chunkSize) {
@@ -180,11 +209,13 @@ async function streamAudio(ws, streamSid, audioUrl) {
             }));
 
             chunkCount++;
+
+            // ✅ IMPORTANT: prevent audio overlap
+            await new Promise(r => setTimeout(r, 20));
         }
 
         console.log("🔊 Sent chunks:", chunkCount);
 
-        // optional mark
         ws.send(JSON.stringify({
             event: "mark",
             stream_sid: streamSid,
