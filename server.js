@@ -10,9 +10,13 @@ console.log("🚀 WSS Server Started on port:", PORT);
 const BACKEND_URL = "https://www.shopanzaservices.in/app_files/response.aspx";
 
 // ================= VAD CONFIG =================
-const SILENCE_THRESHOLD = 200;     // adjust if needed
-const SILENCE_DURATION = 1200;    // ms
-const MAX_BUFFER_DURATION = 5000; // ms
+const SILENCE_THRESHOLD = 200;
+const SILENCE_DURATION = 1200;
+const MAX_BUFFER_DURATION = 5000;
+
+// ================= RETRY CONFIG =================
+const NO_RESPONSE_TIMEOUT = 5000;
+const MAX_RETRY = 2;
 
 wss.on('connection', function connection(ws) {
 
@@ -25,6 +29,12 @@ wss.on('connection', function connection(ws) {
     let bufferStartTime = Date.now();
 
     let processing = false;
+
+    // ✅ NEW VARIABLES
+    let lastQuestion = "";
+    let silenceTimer = null;
+    let retryCount = 0;
+    let isUserSpeaking = false;
 
     console.log("🔌 New Connection");
 
@@ -58,9 +68,13 @@ wss.on('connection', function connection(ws) {
 
                 let now = Date.now();
 
-                // Speech detected
+                // ✅ SPEECH DETECTED
                 if (energy > SILENCE_THRESHOLD) {
                     lastSpeechTime = now;
+                    isUserSpeaking = true;
+
+                    // stop retry timer
+                    if (silenceTimer) clearTimeout(silenceTimer);
                 }
 
                 audioChunks.push(payload);
@@ -68,7 +82,7 @@ wss.on('connection', function connection(ws) {
                 let silenceTime = now - lastSpeechTime;
                 let bufferTime = now - bufferStartTime;
 
-                // 🎯 TRIGGER CONDITION (HYBRID)
+                // 🎯 PROCESS AUDIO
                 if (
                     (silenceTime > SILENCE_DURATION && audioChunks.length > 5) ||
                     bufferTime > MAX_BUFFER_DURATION
@@ -78,7 +92,6 @@ wss.on('connection', function connection(ws) {
 
                     processing = true;
 
-                    // ✅ FIXED MERGE
                     let buffers = audioChunks.map(b64 => Buffer.from(b64, 'base64'));
                     let combinedBuffer = Buffer.concat(buffers);
                     let combinedAudio = combinedBuffer.toString('base64');
@@ -89,6 +102,9 @@ wss.on('connection', function connection(ws) {
                     console.log("🎧 Processing chunk...");
 
                     await processAudio(ws, streamSid, callSid, from, combinedAudio);
+
+                    // reset speaking flag after processing
+                    isUserSpeaking = false;
 
                     processing = false;
                 }
@@ -103,42 +119,80 @@ wss.on('connection', function connection(ws) {
             console.log("❌ Error:", err.message);
         }
     });
-});
 
+    // ================= SILENCE TIMER =================
+    function startSilenceTimer() {
 
-// ================= PROCESS AUDIO =================
-async function processAudio(ws, streamSid, callSid, from, audioBase64) {
+        if (silenceTimer) clearTimeout(silenceTimer);
 
-    try {
-        let res = await axios.post(
-            BACKEND_URL + "/process_voice",
-            {
-                audio: audioBase64,
-                call_sid: callSid,
-                from: from
-            },
-            {
-                headers: { "Content-Type": "application/json" },
-                timeout: 20000
+        silenceTimer = setTimeout(async () => {
+
+            if (!isUserSpeaking && lastQuestion) {
+
+                if (retryCount >= MAX_RETRY) {
+                    console.log("📴 No response, ending call");
+
+                    await sendTTS(ws, streamSid,
+                        "We are ending the call due to no response"
+                    );
+
+                    setTimeout(() => ws.close(), 3000);
+                    return;
+                }
+
+                retryCount++;
+
+                console.log("🔁 Repeating question:", lastQuestion);
+
+                await sendTTS(ws, streamSid, lastQuestion);
             }
-        );
 
-        let data = res.data.d;
-
-        console.log("🤖 AI:", data);
-
-        if (data && data.audio_url) {
-            await streamAudio(ws, streamSid, data.audio_url);
-        }
-
-        if (data && data.status === "completed") {
-            setTimeout(() => ws.close(), 4000);
-        }
-
-    } catch (err) {
-        console.log("❌ Backend Error:", err.message);
+        }, NO_RESPONSE_TIMEOUT);
     }
-}
+
+    // ================= PROCESS AUDIO =================
+    async function processAudio(ws, streamSid, callSid, from, audioBase64) {
+
+        try {
+            let res = await axios.post(
+                BACKEND_URL + "/process_voice",
+                {
+                    audio: audioBase64,
+                    call_sid: callSid,
+                    from: from
+                },
+                {
+                    headers: { "Content-Type": "application/json" },
+                    timeout: 20000
+                }
+            );
+
+            let data = res.data.d;
+
+            console.log("🤖 AI:", data);
+
+            if (data && data.audio_url) {
+
+                await streamAudio(ws, streamSid, data.audio_url);
+
+                // ✅ SAVE LAST QUESTION
+                lastQuestion = extractTextFromAudioUrl(data.audio_url);
+
+                retryCount = 0;
+
+                startSilenceTimer();
+            }
+
+            if (data && data.status === "completed") {
+                setTimeout(() => ws.close(), 4000);
+            }
+
+        } catch (err) {
+            console.log("❌ Backend Error:", err.message);
+        }
+    }
+
+});
 
 
 // ================= ENERGY CALC =================
@@ -167,7 +221,7 @@ async function sendTTS(ws, streamSid, text) {
 
         let audioUrl = res.data.d.audio_url;
 
-        console.log("🔊 TTS:", audioUrl);
+        console.log("🔊 TTS:", text);
 
         await streamAudio(ws, streamSid, audioUrl);
 
@@ -211,4 +265,11 @@ async function streamAudio(ws, streamSid, audioUrl) {
     } catch (err) {
         console.log("Stream Error:", err.message);
     }
+}
+
+
+// ================= OPTIONAL HELPER =================
+function extractTextFromAudioUrl(url) {
+    // fallback if backend doesn't send text
+    return "";
 }
