@@ -16,8 +16,9 @@ wss.on('connection', function connection(ws) {
     let callSid = "";
     let from = "";
 
-    let audioBuffer = [];
-    let lastAudioTime = Date.now();
+    // ================= NEW RMS VOICE SYSTEM =================
+    let audioWindow = [];
+    let silenceTimer = null;
     let processing = false;
     let warningGiven = false;
 
@@ -42,78 +43,65 @@ wss.on('connection', function connection(ws) {
 
                 console.log("📞 Call Started:", callSid, from);
 
-                // 🎤 Greeting
                 await sendTTS(ws, streamSid,
                     "Welcome to Shopanza Services. How may I help you"
                 );
             }
 
-            // ================= MEDIA =================
+            // ================= MEDIA (NEW ENGINE) =================
             if (msg.event === "media") {
 
-                try {
-                    let chunkBuffer = Buffer.from(msg.media.payload, 'base64');
+                audioWindow.push(msg.media.payload);
 
-                    // ❌ ignore noise / very small chunks
-                    if (chunkBuffer.length < 500) return;
+                // reset timer every packet
+                if (silenceTimer) clearTimeout(silenceTimer);
 
-                    audioBuffer.push(chunkBuffer);
-                    lastAudioTime = Date.now();
-
-                } catch (e) {
-                    console.log("⚠️ Invalid chunk skipped");
-                    return;
-                }
-
-                // ================= SILENCE DETECTION =================
-                setTimeout(async () => {
+                silenceTimer = setTimeout(async () => {
 
                     if (processing) return;
-
-                    // wait for 1.5 sec silence
-                    if (Date.now() - lastAudioTime < 1500) return;
-
-                    if (audioBuffer.length === 0) {
-
-                        if (!warningGiven) {
-                            warningGiven = true;
-
-                            await sendTTS(ws, streamSid,
-                                "Kindly share your response else call will disconnect in five seconds"
-                            );
-
-                            setTimeout(() => {
-                                console.log("📴 Disconnect due to silence");
-                                ws.close();
-                            }, 5000);
-                        }
-
-                        return;
-                    }
-
-                    warningGiven = false;
                     processing = true;
 
-                    let combinedBuffer = Buffer.concat(audioBuffer);
-                    audioBuffer = [];
-
-                    // ❌ skip small audio (avoid STT waste)
-                    if (combinedBuffer.length < 4000) {
-                        console.log("⏭️ Skipping small/empty audio");
-                        processing = false;
-                        return;
-                    }
-
-                    console.log("🎧 Processing speech... Size:", combinedBuffer.length);
-
-                    let combinedAudio = combinedBuffer.toString('base64');
-
                     try {
+
+                        // ================= CONVERT BASE64 → PCM =================
+                        let buffers = [];
+
+                        for (let i = 0; i < audioWindow.length; i++) {
+                            try {
+                                buffers.push(Buffer.from(audioWindow[i], 'base64'));
+                            } catch (e) {}
+                        }
+
+                        audioWindow = [];
+
+                        let combined = Buffer.concat(buffers);
+
+                        if (combined.length < 1500) {
+                            console.log("🔇 Too small audio ignored");
+                            processing = false;
+                            return;
+                        }
+
+                        // ================= RMS CHECK =================
+                        let rms = calculateRMS(combined);
+
+                        console.log("📊 RMS:", rms.toFixed(4));
+
+                        // silence threshold
+                        if (rms < 0.008) {
+                            console.log("🔇 Silence detected, skipping STT");
+                            processing = false;
+                            return;
+                        }
+
+                        console.log("🎧 Sending to backend STT...");
+
+                        let base64Audio = combined.toString('base64');
 
                         let res = await axios.post(
                             BACKEND_URL + "/process_voice",
                             {
-                                audio: combinedAudio,
+                                audio: base64Audio,
                                 call_sid: callSid,
                                 from: from
                             },
@@ -123,30 +111,26 @@ wss.on('connection', function connection(ws) {
                             }
                         );
 
-                        let data = res.data.d;
+                        let data = res.data.d || res.data;
 
-                        console.log("🤖 AI Response:", data);
+                        console.log("🤖 AI RESPONSE:", data);
 
-                        // 🔊 Play response
-                        if (data && data.audio_url) {
+                        if (data?.audio_url) {
                             await streamAudio(ws, streamSid, data.audio_url);
-                        } else {
-                            console.log("⚠️ No audio_url received");
                         }
 
-                        // ✅ Booking complete
-                        if (data && data.status === "completed") {
-                            console.log("✅ Booking Completed");
-                            setTimeout(() => ws.close(), 4000);
+                        if (data?.status === "completed") {
+                            console.log("✅ Call completed");
+                            setTimeout(() => ws.close(), 3000);
                         }
 
                     } catch (err) {
-                        console.log("❌ Backend Error:", err.message);
+                        console.log("❌ Backend error:", err.message);
                     }
 
                     processing = false;
 
-                }, 1600);
+                }, 2000); // 2 sec window
             }
 
             // ================= STOP =================
@@ -161,17 +145,17 @@ wss.on('connection', function connection(ws) {
 });
 
 
-// ================= TTS CALL =================
+// ================= TTS =================
 async function sendTTS(ws, streamSid, text) {
 
     try {
         let res = await axios.post(
             BACKEND_URL + "/tts_direct",
-            { text: text },
+            { text },
             { headers: { "Content-Type": "application/json" } }
         );
 
-        let audioUrl = res.data.d.audio_url;
+        let audioUrl = res.data.d?.audio_url || res.data.audio_url;
 
         console.log("🔊 TTS URL:", audioUrl);
 
@@ -183,7 +167,7 @@ async function sendTTS(ws, streamSid, text) {
 }
 
 
-// ================= STREAM AUDIO TO EXOTEL =================
+// ================= STREAM AUDIO =================
 async function streamAudio(ws, streamSid, audioUrl) {
 
     try {
@@ -193,7 +177,7 @@ async function streamAudio(ws, streamSid, audioUrl) {
 
         let buffer = Buffer.from(response.data);
 
-        let chunkSize = 3200; // 100ms chunks
+        let chunkSize = 3200;
         let chunkCount = 0;
 
         for (let i = 0; i < buffer.length; i += chunkSize) {
@@ -210,7 +194,6 @@ async function streamAudio(ws, streamSid, audioUrl) {
 
             chunkCount++;
 
-            // ✅ smooth playback (VERY IMPORTANT)
             await new Promise(r => setTimeout(r, 20));
         }
 
@@ -225,4 +208,21 @@ async function streamAudio(ws, streamSid, audioUrl) {
     } catch (err) {
         console.log("Stream Error:", err.message);
     }
+}
+
+
+// ================= RMS CALCULATION =================
+function calculateRMS(buffer) {
+
+    let sum = 0;
+
+    for (let i = 0; i < buffer.length; i += 2) {
+
+        let val = buffer.readInt16LE(i);
+        sum += val * val;
+    }
+
+    let rms = Math.sqrt(sum / (buffer.length / 2));
+
+    return rms / 32768; // normalize
 }
