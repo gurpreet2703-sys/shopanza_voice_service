@@ -57,65 +57,50 @@ wss.on('connection', function connection(ws) {
 
                 silenceTimer = setTimeout(async () => {
 
-                    // ❌ No speech detected
-                    if (audioBuffer.length === 0) {
-
-                        if (!warningGiven) {
-                            warningGiven = true;
-
-                            await sendTTS(ws, streamSid,
-                                "Kindly share your response else call will disconnect in five seconds"
-                            );
-
-                            setTimeout(() => {
-                                console.log("📴 Disconnect due to silence");
-                                ws.close();
-                            }, 5000);
-                        }
-
+                    if (audioBuffer.length < 5) {
+                        // very small audio → ignore
+                        audioBuffer = [];
                         return;
                     }
-
-                    warningGiven = false;
 
                     let combinedAudio = audioBuffer.join("");
                     audioBuffer = [];
 
-                    console.log("🎧 Sending audio to backend...");
+                    console.log("🎧 Processing user speech...");
 
-                    // 🔥 CALL ASP.NET BACKEND
-                    let res = await axios.post(
-                        BACKEND_URL + "/process_voice",
-                        {
-                            audio: combinedAudio,
-                            call_sid: callSid,
-                            from: from
-                        },
-                        {
-                            headers: { "Content-Type": "application/json" },
-                            timeout: 20000
+                    try {
+
+                        let res = await axios.post(
+                            BACKEND_URL + "/process_voice",
+                            {
+                                audio: combinedAudio,
+                                call_sid: callSid,
+                                from: from
+                            },
+                            {
+                                headers: { "Content-Type": "application/json" },
+                                timeout: 20000
+                            }
+                        );
+
+                        let data = res.data;
+
+                        console.log("🤖 AI Response:", data);
+
+                        if (data.audio_url) {
+                            await streamAudio(ws, streamSid, data.audio_url);
                         }
-                    );
 
-                    // ✅ FIX: handle ASP.NET response wrapper
-                    let data = res.data.d;
+                        if (data.status === "completed") {
+                            console.log("✅ Booking completed");
+                            setTimeout(() => ws.close(), 4000);
+                        }
 
-                    console.log("🤖 AI Response:", data);
-
-                    // 🔊 Play AI response
-                    if (data && data.audio_url) {
-                        await streamAudio(ws, streamSid, data.audio_url);
-                    } else {
-                        console.log("⚠️ No audio_url received");
+                    } catch (err) {
+                        console.log("❌ Backend Error:", err.message);
                     }
 
-                    // ✅ Booking complete → close call
-                    if (data && data.status === "completed") {
-                        console.log("✅ Booking Completed, closing call");
-                        setTimeout(() => ws.close(), 4000);
-                    }
-
-                }, 2000); // 2 sec buffer
+                }, 1200); // 🔥 reduced from 2000 → faster response
             }
 
             // ================= STOP =================
