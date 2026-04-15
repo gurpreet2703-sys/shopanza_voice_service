@@ -1,40 +1,32 @@
-const WebSocket = require('ws');
-const axios = require('axios');
+const WebSocket = require("ws");
+const axios = require("axios");
 
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
-console.log("🚀 WSS Server Started on port:", PORT);
+console.log("🚀 Production Voice AI WSS running on:", PORT);
 
 // ================= CONFIG =================
 const BACKEND_URL = "https://www.shopanzaservices.in/app_files/response.aspx";
 
-// ================= UTILS =================
-function calculateRMS(buffer) {
-    let sum = 0;
-
-    for (let i = 0; i < buffer.length; i++) {
-        let val = buffer[i] - 128;
-        sum += val * val;
-    }
-
-    return Math.sqrt(sum / buffer.length);
-}
-
-wss.on('connection', function (ws) {
+// ================= STATE =================
+wss.on("connection", (ws) => {
 
     let streamSid = "";
     let callSid = "";
     let from = "";
 
     let audioChunks = [];
-    let lastActiveTime = Date.now();
-
+    let silenceTimer = null;
     let processing = false;
 
-    console.log("🔌 New Connection");
+    const SILENCE_MS = 1200;      // key tuning
+    const MIN_CHUNKS = 8;         // avoid noise
 
-    ws.on('message', async (message) => {
+    console.log("🔌 New call connected");
+
+    // ================= MESSAGE =================
+    ws.on("message", async (message) => {
 
         try {
             const msg = JSON.parse(message.toString());
@@ -56,36 +48,14 @@ wss.on('connection', function (ws) {
             // ================= MEDIA =================
             if (msg.event === "media") {
 
-                let chunk = Buffer.from(msg.media.payload, 'base64');
+                audioChunks.push(Buffer.from(msg.media.payload, "base64"));
 
-                audioChunks.push(chunk);
-
-                lastActiveTime = Date.now();
-
-                // 🔥 REAL-TIME SILENCE CHECK (RMS)
-                let rms = calculateRMS(chunk);
-
-                // log only occasionally
-                if (Math.random() < 0.02) {
-                    console.log("🎚 RMS:", rms.toFixed(2));
-                }
-
-                // 🔴 SILENCE DETECTED EARLY → PROCESS IMMEDIATELY
-                if (rms < 6 && audioChunks.length > 8 && !processing) {
-                    processAudio();
-                }
-
-                // 🔴 FORCE PROCESS AFTER 2.5 SEC
-                setTimeout(() => {
-                    if (!processing && Date.now() - lastActiveTime > 2500) {
-                        processAudio();
-                    }
-                }, 2600);
+                resetSilenceTimer();
             }
 
             // ================= STOP =================
             if (msg.event === "stop") {
-                console.log("📴 Call Ended");
+                console.log("📴 Call ended");
             }
 
         } catch (err) {
@@ -93,25 +63,38 @@ wss.on('connection', function (ws) {
         }
     });
 
-    // ================= PROCESS AUDIO =================
-    async function processAudio() {
+    // ================= SILENCE DETECTOR =================
+    function resetSilenceTimer() {
+
+        clearTimeout(silenceTimer);
+
+        silenceTimer = setTimeout(() => {
+
+            if (processing) return;
+
+            if (audioChunks.length < MIN_CHUNKS) {
+                audioChunks = [];
+                return;
+            }
+
+            processAudioSegment();
+
+        }, SILENCE_MS);
+    }
+
+    // ================= PROCESS SPEECH =================
+    async function processAudioSegment() {
 
         if (processing) return;
         processing = true;
 
         try {
-            if (audioChunks.length < 5) {
-                processing = false;
-                audioChunks = [];
-                return;
-            }
-
-            console.log("🎧 Processing audio chunks:", audioChunks.length);
-
             let buffer = Buffer.concat(audioChunks);
             audioChunks = [];
 
-            let base64Audio = buffer.toString('base64');
+            console.log("🎧 Speech detected:", buffer.length, "bytes");
+
+            let base64Audio = buffer.toString("base64");
 
             let res = await axios.post(
                 BACKEND_URL + "/process_voice",
@@ -120,7 +103,7 @@ wss.on('connection', function (ws) {
                     call_sid: callSid,
                     from: from
                 },
-                { timeout: 25000 }
+                { timeout: 30000 }
             );
 
             let data = res.data.d || res.data;
@@ -132,11 +115,12 @@ wss.on('connection', function (ws) {
             }
 
         } catch (err) {
-            console.log("❌ Process Error:", err.message);
+            console.log("❌ STT ERROR:", err.message);
         }
 
         processing = false;
     }
+
 });
 
 // ================= TTS =================
@@ -154,7 +138,7 @@ async function sendTTS(ws, streamSid, text) {
         await streamAudio(ws, streamSid, data.audio_url);
 
     } catch (err) {
-        console.log("TTS Error:", err.message);
+        console.log("TTS ERROR:", err.message);
     }
 }
 
@@ -174,7 +158,7 @@ async function streamAudio(ws, streamSid, audioUrl) {
                 event: "media",
                 stream_sid: streamSid,
                 media: {
-                    payload: buffer.slice(i, i + chunkSize).toString('base64')
+                    payload: buffer.slice(i, i + chunkSize).toString("base64")
                 }
             }));
 
@@ -188,6 +172,6 @@ async function streamAudio(ws, streamSid, audioUrl) {
         }));
 
     } catch (err) {
-        console.log("Stream Error:", err.message);
+        console.log("STREAM ERROR:", err.message);
     }
 }
