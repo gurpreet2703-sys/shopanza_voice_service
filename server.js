@@ -14,9 +14,9 @@ const SILENCE_THRESHOLD = 200;
 const SILENCE_DURATION = 1200;
 const MAX_BUFFER_DURATION = 5000;
 
-// ================= NEW TIMING CONFIG =================
-const FIRST_REMINDER_TIME = 8000;   // 8 sec
-const FINAL_TIMEOUT = 16000;        // 16 sec
+// ================= RETRY CONFIG =================
+const NO_RESPONSE_TIMEOUT = 5000;
+const MAX_RETRY = 2;
 
 wss.on('connection', function connection(ws) {
 
@@ -30,10 +30,11 @@ wss.on('connection', function connection(ws) {
 
     let processing = false;
 
-    // ✅ STATE VARIABLES
+    // ✅ NEW VARIABLES
     let lastQuestion = "";
-    let reminderSent = false;
-    let callEnded = false;
+    let silenceTimer = null;
+    let retryCount = 0;
+    let isUserSpeaking = false;
 
     console.log("🔌 New Connection");
 
@@ -54,9 +55,6 @@ wss.on('connection', function connection(ws) {
                 await sendTTS(ws, streamSid,
                     "Welcome to Shopanza Services. How may I help you"
                 );
-
-                lastQuestion = "How may I help you";
-                lastSpeechTime = Date.now();
             }
 
             // ================= MEDIA =================
@@ -65,13 +63,18 @@ wss.on('connection', function connection(ws) {
                 const payload = msg.media.payload;
 
                 let pcmBuffer = Buffer.from(payload, 'base64');
+
                 let energy = calculateEnergy(pcmBuffer);
+
                 let now = Date.now();
 
-                // ✅ USER SPEAKING
+                // ✅ SPEECH DETECTED
                 if (energy > SILENCE_THRESHOLD) {
                     lastSpeechTime = now;
-                    reminderSent = false;
+                    isUserSpeaking = true;
+
+                    // stop retry timer
+                    if (silenceTimer) clearTimeout(silenceTimer);
                 }
 
                 audioChunks.push(payload);
@@ -100,6 +103,9 @@ wss.on('connection', function connection(ws) {
 
                     await processAudio(ws, streamSid, callSid, from, combinedAudio);
 
+                    // reset speaking flag after processing
+                    isUserSpeaking = false;
+
                     processing = false;
                 }
             }
@@ -107,8 +113,6 @@ wss.on('connection', function connection(ws) {
             // ================= STOP =================
             if (msg.event === "stop") {
                 console.log("📴 Call Ended");
-                callEnded = true;
-                clearInterval(silenceInterval);
             }
 
         } catch (err) {
@@ -116,50 +120,35 @@ wss.on('connection', function connection(ws) {
         }
     });
 
-    // ================= SILENCE WATCHER =================
-    let silenceInterval = setInterval(async () => {
+    // ================= SILENCE TIMER =================
+    function startSilenceTimer() {
 
-        if (callEnded) return;
+        if (silenceTimer) clearTimeout(silenceTimer);
 
-        let now = Date.now();
-        let silence = now - lastSpeechTime;
+        silenceTimer = setTimeout(async () => {
 
-        try {
+            if (!isUserSpeaking && lastQuestion) {
 
-            // ⏱ 8 sec → reminder
-            if (silence > FIRST_REMINDER_TIME && !reminderSent) {
+                if (retryCount >= MAX_RETRY) {
+                    console.log("📴 No response, ending call");
 
-                reminderSent = true;
+                    await sendTTS(ws, streamSid,
+                        "We are ending the call due to no response"
+                    );
 
-                console.log("⏳ Reminder triggered");
+                    setTimeout(() => ws.close(), 3000);
+                    return;
+                }
 
-                await sendTTS(ws, streamSid,
-                    "I am waiting for your response"
-                );
+                retryCount++;
+
+                console.log("🔁 Repeating question:", lastQuestion);
+
+                await sendTTS(ws, streamSid, lastQuestion);
             }
 
-            // ⏱ 16 sec → end call
-            if (silence > FINAL_TIMEOUT) {
-
-                console.log("📴 Ending call due to no response");
-
-                callEnded = true;
-
-                await sendTTS(ws, streamSid,
-                    "Thank you for using Shopanza Services"
-                );
-
-                setTimeout(() => ws.close(), 4000);
-
-                clearInterval(silenceInterval);
-            }
-
-        } catch (err) {
-            console.log("❌ Silence Error:", err.message);
-        }
-
-    }, 1000);
-
+        }, NO_RESPONSE_TIMEOUT);
+    }
 
     // ================= PROCESS AUDIO =================
     async function processAudio(ws, streamSid, callSid, from, audioBase64) {
@@ -186,14 +175,12 @@ wss.on('connection', function connection(ws) {
 
                 await streamAudio(ws, streamSid, data.audio_url);
 
-                // ✅ USE BACKEND TEXT
-                if (data.text) {
-                    lastQuestion = data.text;
-                }
+                // ✅ SAVE LAST QUESTION
+                lastQuestion = extractTextFromAudioUrl(data.audio_url);
 
-                // ✅ RESET TIMER AFTER BOT SPEAKS
-                lastSpeechTime = Date.now();
-                reminderSent = false;
+                retryCount = 0;
+
+                startSilenceTimer();
             }
 
             if (data && data.status === "completed") {
@@ -238,9 +225,6 @@ async function sendTTS(ws, streamSid, text) {
 
         await streamAudio(ws, streamSid, audioUrl);
 
-        // ✅ IMPORTANT: reset timer AFTER speaking
-        // (handled in processAudio also but safe here)
-        
     } catch (err) {
         console.log("TTS Error:", err.message);
     }
@@ -281,4 +265,11 @@ async function streamAudio(ws, streamSid, audioUrl) {
     } catch (err) {
         console.log("Stream Error:", err.message);
     }
+}
+
+
+// ================= OPTIONAL HELPER =================
+function extractTextFromAudioUrl(url) {
+    // fallback if backend doesn't send text
+    return "";
 }
