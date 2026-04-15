@@ -17,8 +17,10 @@ wss.on('connection', function connection(ws) {
     let from = "";
 
     let audioBuffer = [];
-    let silenceTimer = null;
     let warningGiven = false;
+
+    // ✅ NEW: time-based processing
+    let lastProcessTime = Date.now();
 
     console.log("🔌 New Connection");
 
@@ -52,57 +54,63 @@ wss.on('connection', function connection(ws) {
 
                 audioBuffer.push(msg.media.payload);
 
-                // Reset silence timer
-                if (silenceTimer) clearTimeout(silenceTimer);
+                let now = Date.now();
 
-                silenceTimer = setTimeout(async () => {
+                // ✅ REAL-TIME PROCESSING (every 2 sec)
+                if (now - lastProcessTime < 2000) {
+                    return;
+                }
 
-                    // ❌ No speech detected
-                    if (audioBuffer.length === 0) {
+                lastProcessTime = now;
 
-                        if (!warningGiven) {
-                            warningGiven = true;
+                // ❌ No speech detected
+                if (audioBuffer.length === 0) {
 
-                            await sendTTS(ws, streamSid,
-                                "Kindly share your response else call will disconnect in five seconds"
-                            );
+                    if (!warningGiven) {
+                        warningGiven = true;
 
-                            setTimeout(() => {
-                                console.log("📴 Disconnect due to silence");
-                                ws.close();
-                            }, 5000);
-                        }
+                        await sendTTS(ws, streamSid,
+                            "Kindly share your response else call will disconnect in five seconds"
+                        );
 
-                        return;
+                        setTimeout(() => {
+                            console.log("📴 Disconnect due to silence");
+                            ws.close();
+                        }, 5000);
                     }
 
-                    warningGiven = false;
+                    return;
+                }
 
-                    // ================= ✅ FIXED AUDIO MERGING =================
-                    let buffers = [];
+                warningGiven = false;
 
-                    for (let i = 0; i < audioBuffer.length; i++) {
-                        try {
-                            let buf = Buffer.from(audioBuffer[i], 'base64');
-                            buffers.push(buf);
-                        } catch (e) {
-                            console.log("⚠️ Invalid chunk skipped");
-                        }
+                // ================= AUDIO MERGE =================
+                let buffers = [];
+
+                for (let i = 0; i < audioBuffer.length; i++) {
+                    try {
+                        let buf = Buffer.from(audioBuffer[i], 'base64');
+                        buffers.push(buf);
+                    } catch (e) {
+                        console.log("⚠️ Invalid chunk skipped");
                     }
+                }
 
-                    let combinedBuffer = Buffer.concat(buffers);
+                let combinedBuffer = Buffer.concat(buffers);
 
-                    // ❗ Skip very small audio (noise / silence)
-                    if (combinedBuffer.length < 2000) {
-                        console.log("⏭️ Skipping small audio");
-                        audioBuffer = [];
-                        return;
-                    }
-
-                    let combinedAudio = combinedBuffer.toString('base64');
+                // ❗ Skip noise / very small audio
+                if (combinedBuffer.length < 2000) {
+                    console.log("⏭️ Skipping small audio");
                     audioBuffer = [];
+                    return;
+                }
 
-                    console.log("🎧 Sending audio to backend... Size:", combinedBuffer.length);
+                let combinedAudio = combinedBuffer.toString('base64');
+                audioBuffer = [];
+
+                console.log("🎧 Sending audio to backend... Size:", combinedBuffer.length);
+
+                try {
 
                     // 🔥 CALL ASP.NET BACKEND
                     let res = await axios.post(
@@ -118,7 +126,6 @@ wss.on('connection', function connection(ws) {
                         }
                     );
 
-                    // ✅ ASP.NET response wrapper fix
                     let data = res.data.d;
 
                     console.log("🤖 AI Response:", data);
@@ -136,7 +143,9 @@ wss.on('connection', function connection(ws) {
                         setTimeout(() => ws.close(), 4000);
                     }
 
-                }, 2000); // 2 sec buffer
+                } catch (err) {
+                    console.log("❌ Backend Error:", err.message);
+                }
             }
 
             // ================= STOP =================
@@ -200,7 +209,7 @@ async function streamAudio(ws, streamSid, audioUrl) {
 
             chunkCount++;
 
-            // ✅ IMPORTANT: small delay for smooth playback
+            // ✅ Smooth playback
             await new Promise(r => setTimeout(r, 20));
         }
 
