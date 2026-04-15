@@ -1,35 +1,36 @@
-const WebSocket = require("ws");
-const axios = require("axios");
+const WebSocket = require('ws');
+const axios = require('axios');
 
 const PORT = process.env.PORT || 8080;
+
 const wss = new WebSocket.Server({ port: PORT });
 
-console.log("🚀 Production Voice AI WSS running on:", PORT);
+console.log("🚀 WSS Server Started on port:", PORT);
 
-// ================= CONFIG =================
+// ================= GLOBAL CONFIG =================
 const BACKEND_URL = "https://www.shopanzaservices.in/app_files/response.aspx";
 
-// ================= STATE =================
-wss.on("connection", (ws) => {
+wss.on('connection', function connection(ws) {
 
     let streamSid = "";
     let callSid = "";
     let from = "";
 
-    let audioChunks = [];
+    let audioBuffer = [];
     let silenceTimer = null;
-    let processing = false;
+    let warningGiven = false;
 
-    const SILENCE_MS = 1200;      // key tuning
-    const MIN_CHUNKS = 8;         // avoid noise
+    console.log("🔌 New Connection");
 
-    console.log("🔌 New call connected");
-
-    // ================= MESSAGE =================
-    ws.on("message", async (message) => {
+    ws.on('message', async function incoming(message) {
 
         try {
             const msg = JSON.parse(message.toString());
+
+            // ================= CONNECTED =================
+            if (msg.event === "connected") {
+                console.log("✅ Connected Event");
+            }
 
             // ================= START =================
             if (msg.event === "start") {
@@ -38,8 +39,9 @@ wss.on("connection", (ws) => {
                 callSid = msg.start.call_sid;
                 from = msg.start.from;
 
-                console.log("📞 Call Started:", callSid);
+                console.log("📞 Call Started:", callSid, from);
 
+                // 🎤 Greeting
                 await sendTTS(ws, streamSid,
                     "Welcome to Shopanza Services. How may I help you"
                 );
@@ -48,130 +50,170 @@ wss.on("connection", (ws) => {
             // ================= MEDIA =================
             if (msg.event === "media") {
 
-                audioChunks.push(Buffer.from(msg.media.payload, "base64"));
+                audioBuffer.push(msg.media.payload);
 
-                resetSilenceTimer();
+                // Reset silence timer
+                if (silenceTimer) clearTimeout(silenceTimer);
+
+                silenceTimer = setTimeout(async () => {
+
+                    // ❌ No speech detected
+                    if (audioBuffer.length === 0) {
+
+                        if (!warningGiven) {
+                            warningGiven = true;
+
+                            await sendTTS(ws, streamSid,
+                                "Kindly share your response else call will disconnect in five seconds"
+                            );
+
+                            setTimeout(() => {
+                                console.log("📴 Disconnect due to silence");
+                                ws.close();
+                            }, 5000);
+                        }
+
+                        return;
+                    }
+
+                    warningGiven = false;
+
+                    // ================= ✅ FIXED AUDIO MERGING =================
+                    let buffers = [];
+
+                    for (let i = 0; i < audioBuffer.length; i++) {
+                        try {
+                            let buf = Buffer.from(audioBuffer[i], 'base64');
+                            buffers.push(buf);
+                        } catch (e) {
+                            console.log("⚠️ Invalid chunk skipped");
+                        }
+                    }
+
+                    let combinedBuffer = Buffer.concat(buffers);
+
+                    // ❗ Skip very small audio (noise / silence)
+                    if (combinedBuffer.length < 2000) {
+                        console.log("⏭️ Skipping small audio");
+                        audioBuffer = [];
+                        return;
+                    }
+
+                    let combinedAudio = combinedBuffer.toString('base64');
+                    audioBuffer = [];
+
+                    console.log("🎧 Sending audio to backend... Size:", combinedBuffer.length);
+
+                    // 🔥 CALL ASP.NET BACKEND
+                    let res = await axios.post(
+                        BACKEND_URL + "/process_voice",
+                        {
+                            audio: combinedAudio,
+                            call_sid: callSid,
+                            from: from
+                        },
+                        {
+                            headers: { "Content-Type": "application/json" },
+                            timeout: 20000
+                        }
+                    );
+
+                    // ✅ ASP.NET response wrapper fix
+                    let data = res.data.d;
+
+                    console.log("🤖 AI Response:", data);
+
+                    // 🔊 Play AI response
+                    if (data && data.audio_url) {
+                        await streamAudio(ws, streamSid, data.audio_url);
+                    } else {
+                        console.log("⚠️ No audio_url received");
+                    }
+
+                    // ✅ Booking complete → close call
+                    if (data && data.status === "completed") {
+                        console.log("✅ Booking Completed, closing call");
+                        setTimeout(() => ws.close(), 4000);
+                    }
+
+                }, 2000); // 2 sec buffer
             }
 
             // ================= STOP =================
             if (msg.event === "stop") {
-                console.log("📴 Call ended");
+                console.log("📴 Call Ended");
             }
 
         } catch (err) {
             console.log("❌ Error:", err.message);
         }
     });
-
-    // ================= SILENCE DETECTOR =================
-    function resetSilenceTimer() {
-
-        clearTimeout(silenceTimer);
-
-        silenceTimer = setTimeout(() => {
-
-            if (processing) return;
-
-            if (audioChunks.length < MIN_CHUNKS) {
-                audioChunks = [];
-                return;
-            }
-
-            processAudioSegment();
-
-        }, SILENCE_MS);
-    }
-
-    // ================= PROCESS SPEECH =================
-    async function processAudioSegment() {
-
-        if (processing) return;
-        processing = true;
-
-        try {
-            let buffer = Buffer.concat(audioChunks);
-            audioChunks = [];
-
-            console.log("🎧 Speech detected:", buffer.length, "bytes");
-
-            let base64Audio = buffer.toString("base64");
-
-            let res = await axios.post(
-                BACKEND_URL + "/process_voice",
-                {
-                    audio: base64Audio,
-                    call_sid: callSid,
-                    from: from
-                },
-                { timeout: 30000 }
-            );
-
-            let data = res.data.d || res.data;
-
-            console.log("🤖 Response:", data);
-
-            if (data?.audio_url) {
-                await streamAudio(ws, streamSid, data.audio_url);
-            }
-
-        } catch (err) {
-            console.log("❌ STT ERROR:", err.message);
-        }
-
-        processing = false;
-    }
-
 });
 
-// ================= TTS =================
+
+// ================= TTS CALL =================
 async function sendTTS(ws, streamSid, text) {
 
     try {
         let res = await axios.post(
             BACKEND_URL + "/tts_direct",
-            { text },
-            { timeout: 15000 }
+            { text: text },
+            { headers: { "Content-Type": "application/json" } }
         );
 
-        let data = res.data.d || res.data;
+        let audioUrl = res.data.d.audio_url;
 
-        await streamAudio(ws, streamSid, data.audio_url);
+        console.log("🔊 TTS URL:", audioUrl);
+
+        await streamAudio(ws, streamSid, audioUrl);
 
     } catch (err) {
-        console.log("TTS ERROR:", err.message);
+        console.log("TTS Error:", err.message);
     }
 }
 
-// ================= STREAM AUDIO =================
+
+// ================= STREAM AUDIO TO EXOTEL =================
 async function streamAudio(ws, streamSid, audioUrl) {
 
     try {
-        let res = await axios.get(audioUrl, { responseType: "arraybuffer" });
+        let response = await axios.get(audioUrl, {
+            responseType: 'arraybuffer'
+        });
 
-        let buffer = Buffer.from(res.data);
+        let buffer = Buffer.from(response.data);
 
-        let chunkSize = 3200;
+        let chunkSize = 3200; // 100ms chunks
+        let chunkCount = 0;
 
         for (let i = 0; i < buffer.length; i += chunkSize) {
+
+            let chunk = buffer.slice(i, i + chunkSize);
 
             ws.send(JSON.stringify({
                 event: "media",
                 stream_sid: streamSid,
                 media: {
-                    payload: buffer.slice(i, i + chunkSize).toString("base64")
+                    payload: chunk.toString('base64')
                 }
             }));
 
+            chunkCount++;
+
+            // ✅ IMPORTANT: small delay for smooth playback
             await new Promise(r => setTimeout(r, 20));
         }
 
+        console.log("🔊 Sent chunks:", chunkCount);
+
+        // mark event
         ws.send(JSON.stringify({
             event: "mark",
             stream_sid: streamSid,
-            mark: { name: "end" }
+            mark: { name: "audio_end" }
         }));
 
     } catch (err) {
-        console.log("STREAM ERROR:", err.message);
+        console.log("Stream Error:", err.message);
     }
 }
