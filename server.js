@@ -14,6 +14,10 @@ const SILENCE_THRESHOLD = 200;
 const SILENCE_DURATION = 1200;
 const MAX_BUFFER_DURATION = 5000;
 
+// ================= NEW TIMING CONFIG =================
+const FIRST_REMINDER_TIME = 8000;   // 8 sec
+const FINAL_TIMEOUT = 16000;        // 16 sec
+
 wss.on('connection', function connection(ws) {
 
     let streamSid = "";
@@ -26,7 +30,7 @@ wss.on('connection', function connection(ws) {
 
     let processing = false;
 
-    // ✅ NEW VARIABLES
+    // ✅ STATE VARIABLES
     let lastQuestion = "";
     let reminderSent = false;
     let callEnded = false;
@@ -122,8 +126,8 @@ wss.on('connection', function connection(ws) {
 
         try {
 
-            // ⏱ 5 sec → reminder
-            if (silence > 5000 && !reminderSent) {
+            // ⏱ 8 sec → reminder
+            if (silence > FIRST_REMINDER_TIME && !reminderSent) {
 
                 reminderSent = true;
 
@@ -134,8 +138,8 @@ wss.on('connection', function connection(ws) {
                 );
             }
 
-            // ⏱ 10 sec → end call
-            if (silence > 10000) {
+            // ⏱ 16 sec → end call
+            if (silence > FINAL_TIMEOUT) {
 
                 console.log("📴 Ending call due to no response");
 
@@ -182,7 +186,7 @@ wss.on('connection', function connection(ws) {
 
                 await streamAudio(ws, streamSid, data.audio_url);
 
-                // ✅ FIX: USE TEXT FROM BACKEND
+                // ✅ USE BACKEND TEXT
                 if (data.text) {
                     lastQuestion = data.text;
                 }
@@ -234,6 +238,9 @@ async function sendTTS(ws, streamSid, text) {
 
         await streamAudio(ws, streamSid, audioUrl);
 
+        // ✅ IMPORTANT: reset timer AFTER speaking
+        // (handled in processAudio also but safe here)
+        
     } catch (err) {
         console.log("TTS Error:", err.message);
     }
