@@ -7,8 +7,12 @@ const wss = new WebSocket.Server({ port: PORT });
 
 console.log("🚀 WSS Server Started on port:", PORT);
 
-// ================= GLOBAL CONFIG =================
 const BACKEND_URL = "https://www.shopanzaservices.in/app_files/response.aspx";
+
+// ================= VAD CONFIG =================
+const SILENCE_THRESHOLD = 200;     // adjust if needed
+const SILENCE_DURATION = 1200;    // ms
+const MAX_BUFFER_DURATION = 5000; // ms
 
 wss.on('connection', function connection(ws) {
 
@@ -16,9 +20,11 @@ wss.on('connection', function connection(ws) {
     let callSid = "";
     let from = "";
 
-    let audioBuffer = [];
-    let silenceTimer = null;
-    let warningGiven = false;
+    let audioChunks = [];
+    let lastSpeechTime = Date.now();
+    let bufferStartTime = Date.now();
+
+    let processing = false;
 
     console.log("🔌 New Connection");
 
@@ -27,11 +33,6 @@ wss.on('connection', function connection(ws) {
         try {
             const msg = JSON.parse(message.toString());
 
-            // ================= CONNECTED =================
-            if (msg.event === "connected") {
-                console.log("✅ Connected Event");
-            }
-
             // ================= START =================
             if (msg.event === "start") {
 
@@ -39,9 +40,8 @@ wss.on('connection', function connection(ws) {
                 callSid = msg.start.call_sid;
                 from = msg.start.from;
 
-                console.log("📞 Call Started:", callSid, from);
+                console.log("📞 Call Started:", callSid);
 
-                // 🎤 Greeting
                 await sendTTS(ws, streamSid,
                     "Welcome to Shopanza Services. How may I help you"
                 );
@@ -50,93 +50,45 @@ wss.on('connection', function connection(ws) {
             // ================= MEDIA =================
             if (msg.event === "media") {
 
-                audioBuffer.push(msg.media.payload);
+                const payload = msg.media.payload;
 
-                // Reset silence timer
-                if (silenceTimer) clearTimeout(silenceTimer);
+                let pcmBuffer = Buffer.from(payload, 'base64');
 
-                silenceTimer = setTimeout(async () => {
+                let energy = calculateEnergy(pcmBuffer);
 
-                    // ❌ No speech detected
-                    if (audioBuffer.length === 0) {
+                let now = Date.now();
 
-                        if (!warningGiven) {
-                            warningGiven = true;
+                // Speech detected
+                if (energy > SILENCE_THRESHOLD) {
+                    lastSpeechTime = now;
+                }
 
-                            await sendTTS(ws, streamSid,
-                                "Kindly share your response else call will disconnect in five seconds"
-                            );
+                audioChunks.push(payload);
 
-                            setTimeout(() => {
-                                console.log("📴 Disconnect due to silence");
-                                ws.close();
-                            }, 5000);
-                        }
+                let silenceTime = now - lastSpeechTime;
+                let bufferTime = now - bufferStartTime;
 
-                        return;
-                    }
+                // 🎯 TRIGGER CONDITION (HYBRID)
+                if (
+                    (silenceTime > SILENCE_DURATION && audioChunks.length > 5) ||
+                    bufferTime > MAX_BUFFER_DURATION
+                ) {
 
-                    warningGiven = false;
+                    if (processing) return;
 
-                    // ================= ✅ FIXED AUDIO MERGING =================
-                    let buffers = [];
+                    processing = true;
 
-                    for (let i = 0; i < audioBuffer.length; i++) {
-                        try {
-                            let buf = Buffer.from(audioBuffer[i], 'base64');
-                            buffers.push(buf);
-                        } catch (e) {
-                            console.log("⚠️ Invalid chunk skipped");
-                        }
-                    }
+                    let combinedAudio = audioChunks.join("");
 
-                    let combinedBuffer = Buffer.concat(buffers);
+                    audioChunks = [];
+                    bufferStartTime = Date.now();
 
-                    // ❗ Skip very small audio (noise / silence)
-                    if (combinedBuffer.length < 2000) {
-                        console.log("⏭️ Skipping small audio");
-                        audioBuffer = [];
-                        return;
-                    }
+                    console.log("🎧 Processing chunk...");
 
-                    let combinedAudio = combinedBuffer.toString('base64');
-                    audioBuffer = [];
+                    await processAudio(ws, streamSid, callSid, from, combinedAudio);
 
-                    console.log("🎧 Sending audio to backend... Size:", combinedBuffer.length);
-
-                    // 🔥 CALL ASP.NET BACKEND
-                    let res = await axios.post(
-                        BACKEND_URL + "/process_voice",
-                        {
-                            audio: combinedAudio,
-                            call_sid: callSid,
-                            from: from
-                        },
-                        {
-                            headers: { "Content-Type": "application/json" },
-                            timeout: 20000
-                        }
-                    );
-
-                    // ✅ ASP.NET response wrapper fix
-                    let data = res.data.d;
-
-                    console.log("🤖 AI Response:", data);
-
-                    // 🔊 Play AI response
-                    if (data && data.audio_url) {
-                        await streamAudio(ws, streamSid, data.audio_url);
-                    } else {
-                        console.log("⚠️ No audio_url received");
-                    }
-
-                    // ✅ Booking complete → close call
-                    if (data && data.status === "completed") {
-                        console.log("✅ Booking Completed, closing call");
-                        setTimeout(() => ws.close(), 4000);
-                    }
-
-                }, 2000); // 2 sec buffer
+                    processing = false;
+                }
             }
 
             // ================= STOP =================
@@ -151,7 +103,56 @@ wss.on('connection', function connection(ws) {
 });
 
 
-// ================= TTS CALL =================
+// ================= PROCESS AUDIO =================
+async function processAudio(ws, streamSid, callSid, from, audioBase64) {
+
+    try {
+        let res = await axios.post(
+            BACKEND_URL + "/process_voice",
+            {
+                audio: audioBase64,
+                call_sid: callSid,
+                from: from
+            },
+            {
+                headers: { "Content-Type": "application/json" },
+                timeout: 20000
+            }
+        );
+
+        let data = res.data.d;
+
+        console.log("🤖 AI:", data);
+
+        if (data && data.audio_url) {
+            await streamAudio(ws, streamSid, data.audio_url);
+        }
+
+        if (data && data.status === "completed") {
+            setTimeout(() => ws.close(), 4000);
+        }
+
+    } catch (err) {
+        console.log("❌ Backend Error:", err.message);
+    }
+}
+
+
+// ================= ENERGY CALC =================
+function calculateEnergy(buffer) {
+
+    let sum = 0;
+
+    for (let i = 0; i < buffer.length; i += 2) {
+        let sample = buffer.readInt16LE(i);
+        sum += sample * sample;
+    }
+
+    return Math.sqrt(sum / (buffer.length / 2));
+}
+
+
+// ================= TTS =================
 async function sendTTS(ws, streamSid, text) {
 
     try {
@@ -163,7 +164,7 @@ async function sendTTS(ws, streamSid, text) {
 
         let audioUrl = res.data.d.audio_url;
 
-        console.log("🔊 TTS URL:", audioUrl);
+        console.log("🔊 TTS:", audioUrl);
 
         await streamAudio(ws, streamSid, audioUrl);
 
@@ -173,7 +174,7 @@ async function sendTTS(ws, streamSid, text) {
 }
 
 
-// ================= STREAM AUDIO TO EXOTEL =================
+// ================= STREAM AUDIO =================
 async function streamAudio(ws, streamSid, audioUrl) {
 
     try {
@@ -183,8 +184,7 @@ async function streamAudio(ws, streamSid, audioUrl) {
 
         let buffer = Buffer.from(response.data);
 
-        let chunkSize = 3200; // 100ms chunks
-        let chunkCount = 0;
+        let chunkSize = 3200;
 
         for (let i = 0; i < buffer.length; i += chunkSize) {
 
@@ -197,16 +197,8 @@ async function streamAudio(ws, streamSid, audioUrl) {
                     payload: chunk.toString('base64')
                 }
             }));
-
-            chunkCount++;
-
-            // ✅ IMPORTANT: small delay for smooth playback
-            await new Promise(r => setTimeout(r, 20));
         }
 
-        console.log("🔊 Sent chunks:", chunkCount);
-
-        // mark event
         ws.send(JSON.stringify({
             event: "mark",
             stream_sid: streamSid,
