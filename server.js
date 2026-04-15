@@ -2,6 +2,7 @@ const WebSocket = require('ws');
 const axios = require('axios');
 
 const PORT = process.env.PORT || 8080;
+
 const wss = new WebSocket.Server({ port: PORT });
 
 console.log("🚀 WSS Server Started on port:", PORT);
@@ -10,174 +11,180 @@ console.log("🚀 WSS Server Started on port:", PORT);
 const BACKEND_URL = "https://www.shopanzaservices.in/app_files/response.aspx";
 
 wss.on('connection', function connection(ws) {
+
     let streamSid = "";
     let callSid = "";
     let from = "";
 
     let audioBuffer = [];
     let silenceTimer = null;
-    let isProcessing = false; // Prevents duplicate backend calls while waiting for AI
     let warningGiven = false;
 
-    console.log("🔌 New Connection established");
+    console.log("🔌 New Connection");
 
     ws.on('message', async function incoming(message) {
+
         try {
             const msg = JSON.parse(message.toString());
 
             // ================= CONNECTED =================
             if (msg.event === "connected") {
-                console.log("✅ Exotel Connected");
+                console.log("✅ Connected Event");
             }
 
             // ================= START =================
             if (msg.event === "start") {
+
                 streamSid = msg.stream_sid;
                 callSid = msg.start.call_sid;
                 from = msg.start.from;
 
-                console.log(`📞 Call Started: ${callSid} from ${from}`);
+                console.log("📞 Call Started:", callSid, from);
 
-                // Initial Greeting
-                await sendTTS(ws, streamSid, "Welcome to Shopanza Services. How may I help you?");
+                // 🎤 Greeting
+                await sendTTS(ws, streamSid,
+                    "Welcome to Shopanza Services. How may I help you"
+                );
             }
 
-            // ================= MEDIA (The Core Logic) =================
+            // ================= MEDIA =================
             if (msg.event === "media") {
-                // If AI is currently "speaking" or "processing", we don't buffer new noise
-                if (isProcessing) return;
 
                 audioBuffer.push(msg.media.payload);
 
-                // Clear the previous timer every time new audio data arrives
+                // Reset silence timer
                 if (silenceTimer) clearTimeout(silenceTimer);
 
-                // Set a timer to detect end-of-speech (1.5 seconds of silence)
                 silenceTimer = setTimeout(async () => {
-                    
+
+                    // ❌ No speech detected
                     if (audioBuffer.length === 0) {
-                        // Handle extreme silence (No speech at all)
+
                         if (!warningGiven) {
                             warningGiven = true;
-                            await sendTTS(ws, streamSid, "I'm sorry, I didn't hear anything. Please say that again or the call will disconnect.");
+
+                            await sendTTS(ws, streamSid,
+                                "Kindly share your response else call will disconnect in five seconds"
+                            );
+
                             setTimeout(() => {
-                                if (audioBuffer.length === 0) {
-                                    console.log("📴 Disconnecting due to persistent silence");
-                                    ws.close();
-                                }
+                                console.log("📴 Disconnect due to silence");
+                                ws.close();
                             }, 5000);
                         }
+
                         return;
                     }
 
-                    // User has spoken and then paused -> Process the audio
-                    isProcessing = true; 
                     warningGiven = false;
-                    
+
                     let combinedAudio = audioBuffer.join("");
-                    audioBuffer = []; // Reset buffer for next interaction
+                    audioBuffer = [];
 
-                    console.log("🎧 Sending collected speech to backend...");
+                    console.log("🎧 Sending audio to backend...");
 
-                    try {
-                        const res = await axios.post(
-                            `${BACKEND_URL}/process_voice`,
-                            {
-                                audio: combinedAudio,
-                                call_sid: callSid,
-                                from: from
-                            },
-                            { 
-                                headers: { "Content-Type": "application/json" },
-                                timeout: 15000 
-                            }
-                        );
-
-                        const data = res.data.d; // ASP.NET wrapper
-                        console.log("🤖 AI Response Received:", data);
-
-                        if (data && data.audio_url) {
-                            await streamAudio(ws, streamSid, data.audio_url);
+                    // 🔥 CALL ASP.NET BACKEND
+                    let res = await axios.post(
+                        BACKEND_URL + "/process_voice",
+                        {
+                            audio: combinedAudio,
+                            call_sid: callSid,
+                            from: from
+                        },
+                        {
+                            headers: { "Content-Type": "application/json" },
+                            timeout: 20000
                         }
+                    );
 
-                        // Close call if booking is finished
-                        if (data && data.status === "completed") {
-                            console.log("✅ Flow Completed. Hanging up in 4s...");
-                            setTimeout(() => ws.close(), 4000);
-                        }
+                    // ✅ FIX: handle ASP.NET response wrapper
+                    let data = res.data.d;
 
-                    } catch (err) {
-                        console.error("❌ Backend Processing Error:", err.message);
-                    } finally {
-                        isProcessing = false; // Allow next round of listening
+                    console.log("🤖 AI Response:", data);
+
+                    // 🔊 Play AI response
+                    if (data && data.audio_url) {
+                        await streamAudio(ws, streamSid, data.audio_url);
+                    } else {
+                        console.log("⚠️ No audio_url received");
                     }
 
-                }, 1500); // 1.5s silence threshold
+                    // ✅ Booking complete → close call
+                    if (data && data.status === "completed") {
+                        console.log("✅ Booking Completed, closing call");
+                        setTimeout(() => ws.close(), 4000);
+                    }
+
+                }, 2000); // 2 sec buffer
             }
 
             // ================= STOP =================
             if (msg.event === "stop") {
-                console.log("📴 Call Ended by user");
-                if (silenceTimer) clearTimeout(silenceTimer);
+                console.log("📴 Call Ended");
             }
 
         } catch (err) {
-            console.error("❌ WebSocket Message Error:", err.message);
+            console.log("❌ Error:", err.message);
         }
-    });
-
-    ws.on('close', () => {
-        if (silenceTimer) clearTimeout(silenceTimer);
-        console.log("🔌 Connection Closed");
     });
 });
 
-// ================= HELPER: SEND TEXT TO SPEECH =================
+
+// ================= TTS CALL =================
 async function sendTTS(ws, streamSid, text) {
+
     try {
-        const res = await axios.post(
-            `${BACKEND_URL}/tts_direct`,
+        let res = await axios.post(
+            BACKEND_URL + "/tts_direct",
             { text: text },
             { headers: { "Content-Type": "application/json" } }
         );
 
-        const audioUrl = res.data.d.audio_url;
-        console.log("🔊 Playing TTS:", text);
+        // ✅ FIX: ASP.NET wrapper
+        let audioUrl = res.data.d.audio_url;
+
+        console.log("🔊 TTS URL:", audioUrl);
 
         await streamAudio(ws, streamSid, audioUrl);
+
     } catch (err) {
-        console.error("TTS Error:", err.message);
+        console.log("TTS Error:", err.message);
     }
 }
 
-// ================= HELPER: STREAM WAV TO EXOTEL =================
-async function streamAudio(ws, streamSid, audioUrl) {
-    try {
-        const response = await axios.get(audioUrl, { responseType: 'arraybuffer' });
-        const buffer = Buffer.from(response.data);
 
-        // Exotel expects 160-byte (10ms) or 3200-byte (200ms) chunks for 8kHz
-        const chunkSize = 3200; 
+// ================= STREAM AUDIO TO EXOTEL =================
+async function streamAudio(ws, streamSid, audioUrl) {
+
+    try {
+        let response = await axios.get(audioUrl, {
+            responseType: 'arraybuffer'
+        });
+
+        let buffer = Buffer.from(response.data);
+
+        let chunkSize = 3200; // 100ms chunks (IMPORTANT)
+
         let chunkCount = 0;
 
         for (let i = 0; i < buffer.length; i += chunkSize) {
-            const chunk = buffer.slice(i, i + chunkSize);
 
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    event: "media",
-                    stream_sid: streamSid,
-                    media: {
-                        payload: chunk.toString('base64')
-                    }
-                }));
-                chunkCount++;
-            }
+            let chunk = buffer.slice(i, i + chunkSize);
+
+            ws.send(JSON.stringify({
+                event: "media",
+                stream_sid: streamSid,
+                media: {
+                    payload: chunk.toString('base64')
+                }
+            }));
+
+            chunkCount++;
         }
 
-        console.log(`🔊 Streamed ${chunkCount} chunks to Exotel`);
+        console.log("🔊 Sent chunks:", chunkCount);
 
-        // Send Mark to signal end of audio playback
+        // optional mark
         ws.send(JSON.stringify({
             event: "mark",
             stream_sid: streamSid,
@@ -185,6 +192,6 @@ async function streamAudio(ws, streamSid, audioUrl) {
         }));
 
     } catch (err) {
-        console.error("Stream Audio Error:", err.message);
+        console.log("Stream Error:", err.message);
     }
 }
