@@ -30,7 +30,6 @@ wss.on('connection', function connection(ws) {
 
     let processing = false;
 
-    // ✅ NEW VARIABLES
     let lastQuestion = "";
     let silenceTimer = null;
     let retryCount = 0;
@@ -63,17 +62,13 @@ wss.on('connection', function connection(ws) {
                 const payload = msg.media.payload;
 
                 let pcmBuffer = Buffer.from(payload, 'base64');
-
                 let energy = calculateEnergy(pcmBuffer);
-
                 let now = Date.now();
 
-                // ✅ SPEECH DETECTED
                 if (energy > SILENCE_THRESHOLD) {
                     lastSpeechTime = now;
                     isUserSpeaking = true;
 
-                    // stop retry timer
                     if (silenceTimer) clearTimeout(silenceTimer);
                 }
 
@@ -82,7 +77,6 @@ wss.on('connection', function connection(ws) {
                 let silenceTime = now - lastSpeechTime;
                 let bufferTime = now - bufferStartTime;
 
-                // 🎯 PROCESS AUDIO
                 if (
                     (silenceTime > SILENCE_DURATION && audioChunks.length > 5) ||
                     bufferTime > MAX_BUFFER_DURATION
@@ -103,9 +97,7 @@ wss.on('connection', function connection(ws) {
 
                     await processAudio(ws, streamSid, callSid, from, combinedAudio);
 
-                    // reset speaking flag after processing
                     isUserSpeaking = false;
-
                     processing = false;
                 }
             }
@@ -154,6 +146,8 @@ wss.on('connection', function connection(ws) {
     async function processAudio(ws, streamSid, callSid, from, audioBase64) {
 
         try {
+            const startTime = Date.now();
+
             let res = await axios.post(
                 BACKEND_URL + "/process_voice",
                 {
@@ -167,6 +161,9 @@ wss.on('connection', function connection(ws) {
                 }
             );
 
+            const duration = Date.now() - startTime;
+            console.log("⏱ PROCESS API TIME:", duration, "ms");
+
             let data = res.data.d;
 
             console.log("🤖 AI:", data);
@@ -175,7 +172,6 @@ wss.on('connection', function connection(ws) {
 
                 await streamAudio(ws, streamSid, data.audio_url);
 
-                // ✅ SAVE LAST QUESTION
                 lastQuestion = extractTextFromAudioUrl(data.audio_url);
 
                 retryCount = 0;
@@ -213,15 +209,20 @@ function calculateEnergy(buffer) {
 async function sendTTS(ws, streamSid, text) {
 
     try {
+        const startTime = Date.now();
+
         let res = await axios.post(
             BACKEND_URL + "/tts_direct",
             { text: text },
             { headers: { "Content-Type": "application/json" } }
         );
 
+        const duration = Date.now() - startTime;
+        console.log("⏱ TTS API TIME:", duration, "ms");
+
         let audioUrl = res.data.d.audio_url;
 
-        console.log("🔊 TTS:", text);
+        console.log("🔊 TTS TEXT:", text);
 
         await streamAudio(ws, streamSid, audioUrl);
 
@@ -235,13 +236,19 @@ async function sendTTS(ws, streamSid, text) {
 async function streamAudio(ws, streamSid, audioUrl) {
 
     try {
+        const startTime = Date.now();
+
         let response = await axios.get(audioUrl, {
             responseType: 'arraybuffer'
         });
 
+        const downloadTime = Date.now() - startTime;
+
         let buffer = Buffer.from(response.data);
 
         let chunkSize = 3200;
+
+        const streamStart = Date.now();
 
         for (let i = 0; i < buffer.length; i += chunkSize) {
 
@@ -262,6 +269,13 @@ async function streamAudio(ws, streamSid, audioUrl) {
             mark: { name: "audio_end" }
         }));
 
+        const streamTime = Date.now() - streamStart;
+        const totalTime = Date.now() - startTime;
+
+        console.log("⏱ AUDIO DOWNLOAD:", downloadTime, "ms");
+        console.log("⏱ AUDIO STREAM:", streamTime, "ms");
+        console.log("⏱ TOTAL AUDIO:", totalTime, "ms");
+
     } catch (err) {
         console.log("Stream Error:", err.message);
     }
@@ -270,6 +284,5 @@ async function streamAudio(ws, streamSid, audioUrl) {
 
 // ================= OPTIONAL HELPER =================
 function extractTextFromAudioUrl(url) {
-    // fallback if backend doesn't send text
     return "";
 }
