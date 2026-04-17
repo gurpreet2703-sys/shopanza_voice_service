@@ -14,10 +14,6 @@ const SILENCE_THRESHOLD = 200;
 const SILENCE_DURATION = 1200;
 const MAX_BUFFER_DURATION = 5000;
 
-// ================= RETRY CONFIG =================
-const NO_RESPONSE_TIMEOUT = 5000;
-const MAX_RETRY = 2;
-
 wss.on('connection', function connection(ws) {
 
     let streamSid = "";
@@ -30,10 +26,8 @@ wss.on('connection', function connection(ws) {
 
     let processing = false;
 
-    let lastQuestion = "";
-    let silenceTimer = null;
-    let retryCount = 0;
-    let isUserSpeaking = false;
+    // ✅ BACKEND TIMER
+    let timeoutChecker = null;
 
     console.log("🔌 New Connection");
 
@@ -54,6 +48,9 @@ wss.on('connection', function connection(ws) {
                 await sendTTS(ws, streamSid,
                     "Welcome to Shopanza Services. How may I help you"
                 );
+
+                // ✅ START BACKEND TIMEOUT CHECKER
+                startTimeoutChecker();
             }
 
             // ================= MEDIA =================
@@ -62,14 +59,13 @@ wss.on('connection', function connection(ws) {
                 const payload = msg.media.payload;
 
                 let pcmBuffer = Buffer.from(payload, 'base64');
+
                 let energy = calculateEnergy(pcmBuffer);
+
                 let now = Date.now();
 
                 if (energy > SILENCE_THRESHOLD) {
                     lastSpeechTime = now;
-                    isUserSpeaking = true;
-
-                    if (silenceTimer) clearTimeout(silenceTimer);
                 }
 
                 audioChunks.push(payload);
@@ -97,7 +93,6 @@ wss.on('connection', function connection(ws) {
 
                     await processAudio(ws, streamSid, callSid, from, combinedAudio);
 
-                    isUserSpeaking = false;
                     processing = false;
                 }
             }
@@ -105,6 +100,8 @@ wss.on('connection', function connection(ws) {
             // ================= STOP =================
             if (msg.event === "stop") {
                 console.log("📴 Call Ended");
+
+                if (timeoutChecker) clearInterval(timeoutChecker);
             }
 
         } catch (err) {
@@ -112,42 +109,56 @@ wss.on('connection', function connection(ws) {
         }
     });
 
-    // ================= SILENCE TIMER =================
-    function startSilenceTimer() {
+    // ================= BACKEND TIMEOUT CHECK =================
+    function startTimeoutChecker() {
 
-        if (silenceTimer) clearTimeout(silenceTimer);
+        if (timeoutChecker) clearInterval(timeoutChecker);
 
-        silenceTimer = setTimeout(async () => {
+        timeoutChecker = setInterval(async () => {
 
-            if (!isUserSpeaking && lastQuestion) {
+            if (!callSid) return;
 
-                if (retryCount >= MAX_RETRY) {
-                    console.log("📴 No response, ending call");
+            try {
+                let res = await axios.post(
+                    BACKEND_URL + "/check_timeout",
+                    { call_sid: callSid },
+                    { headers: { "Content-Type": "application/json" } }
+                );
 
-                    await sendTTS(ws, streamSid,
-                        "We are ending the call due to no response"
-                    );
+                let data = res.data.d;
 
-                    setTimeout(() => ws.close(), 3000);
-                    return;
+                if (!data) return;
+
+                if (data.action === "reminder") {
+
+                    console.log("⏰ Reminder:", data.message);
+
+                    await sendTTS(ws, streamSid, data.message);
                 }
 
-                retryCount++;
+                if (data.action === "disconnect") {
 
-                console.log("🔁 Repeating question:", lastQuestion);
+                    console.log("📴 Disconnecting:", data.message);
 
-                await sendTTS(ws, streamSid, lastQuestion);
+                    await sendTTS(ws, streamSid, data.message);
+
+                    setTimeout(() => {
+                        if (timeoutChecker) clearInterval(timeoutChecker);
+                        ws.close();
+                    }, 3000);
+                }
+
+            } catch (err) {
+                console.log("Timeout check error:", err.message);
             }
 
-        }, NO_RESPONSE_TIMEOUT);
+        }, 2000);
     }
 
     // ================= PROCESS AUDIO =================
     async function processAudio(ws, streamSid, callSid, from, audioBase64) {
 
         try {
-            const startTime = Date.now();
-
             let res = await axios.post(
                 BACKEND_URL + "/process_voice",
                 {
@@ -161,26 +172,19 @@ wss.on('connection', function connection(ws) {
                 }
             );
 
-            const duration = Date.now() - startTime;
-            console.log("⏱ PROCESS API TIME:", duration, "ms");
-
             let data = res.data.d;
 
             console.log("🤖 AI:", data);
 
             if (data && data.audio_url) {
-
                 await streamAudio(ws, streamSid, data.audio_url);
-
-                lastQuestion = extractTextFromAudioUrl(data.audio_url);
-
-                retryCount = 0;
-
-                startSilenceTimer();
             }
 
             if (data && data.status === "completed") {
-                setTimeout(() => ws.close(), 4000);
+                setTimeout(() => {
+                    if (timeoutChecker) clearInterval(timeoutChecker);
+                    ws.close();
+                }, 4000);
             }
 
         } catch (err) {
@@ -191,7 +195,7 @@ wss.on('connection', function connection(ws) {
 });
 
 
-// ================= ENERGY CALC =================
+// ================= ENERGY =================
 function calculateEnergy(buffer) {
 
     let sum = 0;
@@ -209,20 +213,15 @@ function calculateEnergy(buffer) {
 async function sendTTS(ws, streamSid, text) {
 
     try {
-        const startTime = Date.now();
-
         let res = await axios.post(
             BACKEND_URL + "/tts_direct",
             { text: text },
             { headers: { "Content-Type": "application/json" } }
         );
 
-        const duration = Date.now() - startTime;
-        console.log("⏱ TTS API TIME:", duration, "ms");
-
         let audioUrl = res.data.d.audio_url;
 
-        console.log("🔊 TTS TEXT:", text);
+        console.log("🔊 TTS:", text);
 
         await streamAudio(ws, streamSid, audioUrl);
 
@@ -232,23 +231,17 @@ async function sendTTS(ws, streamSid, text) {
 }
 
 
-// ================= STREAM AUDIO =================
+// ================= STREAM =================
 async function streamAudio(ws, streamSid, audioUrl) {
 
     try {
-        const startTime = Date.now();
-
         let response = await axios.get(audioUrl, {
             responseType: 'arraybuffer'
         });
 
-        const downloadTime = Date.now() - startTime;
-
         let buffer = Buffer.from(response.data);
 
         let chunkSize = 3200;
-
-        const streamStart = Date.now();
 
         for (let i = 0; i < buffer.length; i += chunkSize) {
 
@@ -269,20 +262,7 @@ async function streamAudio(ws, streamSid, audioUrl) {
             mark: { name: "audio_end" }
         }));
 
-        const streamTime = Date.now() - streamStart;
-        const totalTime = Date.now() - startTime;
-
-        console.log("⏱ AUDIO DOWNLOAD:", downloadTime, "ms");
-        console.log("⏱ AUDIO STREAM:", streamTime, "ms");
-        console.log("⏱ TOTAL AUDIO:", totalTime, "ms");
-
     } catch (err) {
         console.log("Stream Error:", err.message);
     }
-}
-
-
-// ================= OPTIONAL HELPER =================
-function extractTextFromAudioUrl(url) {
-    return "";
 }
