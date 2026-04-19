@@ -26,9 +26,6 @@ wss.on('connection', function connection(ws) {
 
     let processing = false;
 
-    // ✅ STREAM CONTROL
-    let isStreaming = false;
-
     // ✅ BACKEND TIMER
     let timeoutChecker = null;
 
@@ -52,6 +49,7 @@ wss.on('connection', function connection(ws) {
                     "Welcome to Shopanza Services. How may I help you"
                 );
 
+                // ✅ START BACKEND TIMEOUT CHECKER
                 startTimeoutChecker();
             }
 
@@ -66,12 +64,8 @@ wss.on('connection', function connection(ws) {
 
                 let now = Date.now();
 
-                // 🎤 USER SPEAKING DETECTED
                 if (energy > SILENCE_THRESHOLD) {
                     lastSpeechTime = now;
-
-                    // ✅ INTERRUPT BOT SPEECH
-                    isStreaming = false;
                 }
 
                 audioChunks.push(payload);
@@ -115,7 +109,7 @@ wss.on('connection', function connection(ws) {
         }
     });
 
-    // ================= BACKEND TIMEOUT =================
+    // ================= BACKEND TIMEOUT CHECK =================
     function startTimeoutChecker() {
 
         if (timeoutChecker) clearInterval(timeoutChecker);
@@ -135,23 +129,16 @@ wss.on('connection', function connection(ws) {
 
                 if (!data) return;
 
-                // ⏰ REMINDER
                 if (data.action === "reminder") {
-
-                    // ❌ don't interrupt bot speech
-                    if (isStreaming) return;
 
                     console.log("⏰ Reminder:", data.message);
 
                     await sendTTS(ws, streamSid, data.message);
                 }
 
-                // 📴 DISCONNECT
                 if (data.action === "disconnect") {
 
                     console.log("📴 Disconnecting:", data.message);
-
-                    isStreaming = false;
 
                     await sendTTS(ws, streamSid, data.message);
 
@@ -190,10 +177,6 @@ wss.on('connection', function connection(ws) {
             console.log("🤖 AI:", data);
 
             if (data && data.audio_url) {
-
-                // ✅ STOP previous stream before new one
-                isStreaming = false;
-
                 await streamAudio(ws, streamSid, data.audio_url);
             }
 
@@ -240,9 +223,6 @@ async function sendTTS(ws, streamSid, text) {
 
         console.log("🔊 TTS:", text);
 
-        // ✅ STOP any previous stream
-        isStreaming = false;
-
         await streamAudio(ws, streamSid, audioUrl);
 
     } catch (err) {
@@ -255,8 +235,6 @@ async function sendTTS(ws, streamSid, text) {
 async function streamAudio(ws, streamSid, audioUrl) {
 
     try {
-        isStreaming = true;
-
         let response = await axios.get(audioUrl, {
             responseType: 'arraybuffer'
         });
@@ -266,12 +244,6 @@ async function streamAudio(ws, streamSid, audioUrl) {
         let chunkSize = 3200;
 
         for (let i = 0; i < buffer.length; i += chunkSize) {
-
-            // ⛔ STOP if interrupted
-            if (!isStreaming) {
-                console.log("⛔ Stream interrupted");
-                return;
-            }
 
             let chunk = buffer.slice(i, i + chunkSize);
 
@@ -290,10 +262,7 @@ async function streamAudio(ws, streamSid, audioUrl) {
             mark: { name: "audio_end" }
         }));
 
-        isStreaming = false;
-
     } catch (err) {
         console.log("Stream Error:", err.message);
-        isStreaming = false;
     }
 }
